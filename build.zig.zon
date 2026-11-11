@@ -1,0 +1,12 @@
+.{
+    .name = .flightdeck,
+    .version = "0.1.0",
+    .fingerprint = 0x828c8519a9f080b0, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.18.0-dev.1185+4fd71e52d",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
