@@ -132,3 +132,7 @@ fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trail
     const end = @as(Extended, 1) << math.log2_int(@TypeOf(trailer), trailer);
     return trailer + (end << bit);
 }
+
+test {
+    _ = @import("flightdeck_test.zig");
+}
