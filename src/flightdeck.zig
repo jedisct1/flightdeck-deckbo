@@ -1,12 +1,35 @@
-//! The overwrite duplex, a duplex cipher that is as secure as (Turbo)SHAKE.
+//! FlightDeck, a deck cipher built on a duplex cipher.
 //!
-//! https://eprint.iacr.org/2024/1618
+//! A deck cipher has a key, takes a sequence of strings of any length, and can return any number of bytes after each of them.
+//! These bytes depend on the key and on all the strings so far.
+//!
+//! There are two layers:
+//! - `OverwriteDuplex`: a duplex cipher, as secure as (Turbo)SHAKE.
+//! - `FlightDeck`: a deck cipher on top of a duplex cipher.
+//!
+//! FlightDeck: https://eprint.iacr.org/2026/2801
+//! Overwrite duplex: https://eprint.iacr.org/2024/1618
 
 const std = @import("std");
 const assert = std.debug.assert;
 const crypto = std.crypto;
 const math = std.math;
+const mem = std.mem;
+
+const native_endian = @import("builtin").cpu.arch.endian();
+
 const KeccakF = crypto.core.keccak.KeccakF;
+
+/// SHAKE128-FlightDeck, with 128 bits of security.
+pub const Shake128FlightDeck = FlightDeck(Shake128Duplex, 5120, 32);
+/// SHAKE256-FlightDeck, with 256 bits of security.
+pub const Shake256FlightDeck = FlightDeck(Shake256Duplex, 8192, 64);
+/// TurboSHAKE128-FlightDeck, with 128 bits of security.
+/// About twice as fast as SHAKE128-FlightDeck.
+pub const TurboShake128FlightDeck = FlightDeck(TurboShake128Duplex, 5120, 32);
+/// TurboSHAKE256-FlightDeck, with 256 bits of security.
+/// About twice as fast as SHAKE256-FlightDeck.
+pub const TurboShake256FlightDeck = FlightDeck(TurboShake256Duplex, 8192, 64);
 
 /// The overwrite duplex that is as secure as SHAKE128.
 pub const Shake128Duplex = OverwriteDuplex(128, 24, 0x9f);
@@ -125,12 +148,189 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
     };
 }
 
+/// The FlightDeck deck cipher.
+///
+/// You use it like a duplex cipher (see `OverwriteDuplex`), but inputs and outputs can be as long as you want.
+///
+/// Copy an instance to clone it.
+///
+/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`.
+/// Long inputs are cut into chunks of `chunk_length` bytes, and each chunk is summed up in `chaining_value_length` bytes.
+pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime chaining_value_length: usize) type {
+    const block_length = Duplex.block_length;
+
+    comptime assert(chunk_length > 0);
+    comptime assert(chaining_value_length > 0 and chaining_value_length <= block_length);
+    // Output blocks are numbered with a 64-bit integer, and that has to fit in a block.
+    comptime assert(block_length >= @sizeOf(u64));
+
+    return struct {
+        const Self = @This();
+
+        const no_output = math.maxInt(u64);
+
+        /// Recommended key length, in bytes.
+        pub const key_length = Duplex.key_length;
+        /// Maximum key length, in bytes.
+        pub const key_length_max = Duplex.key_length_max;
+        /// A trailer of up to 4 bits, from 1 to 31.
+        pub const Trailer = @Int(.unsigned, @bitSizeOf(Duplex.Trailer) - 1);
+
+        d: Duplex,
+        /// The current output block, after the first one.
+        block: [block_length]u8 = undefined,
+        offset: u64 = no_output,
+
+        /// Set the key, of up to `key_length_max` bytes.
+        /// Nothing can be squeezed before the first call to `duplex`.
+        pub fn init(key: []const u8) Self {
+            return .{ .d = .init(key) };
+        }
+
+        /// A clone that can only be used to call `duplex`.
+        /// It can't squeeze what is left of the current output.
+        pub fn cloneCompact(self: *const Self) Self {
+            return .{ .d = self.d.cloneCompact() };
+        }
+
+        /// Absorb a string and its trailer, then squeeze `out`.
+        /// `in` and `out` can be of any length.
+        pub fn duplex(self: *Self, out: []u8, in: []const u8, trailer: Trailer) void {
+            const last_trailer = appendBit(trailer, 1);
+
+            if (in.len <= chunk_length) {
+                absorb(&self.d, in, last_trailer);
+            } else {
+                // Every chunk after the first one starts from this state.
+                const d0 = self.d.cloneCompact();
+                var root: Root = .{ .d = &self.d };
+                root.update(in[0..chunk_length]);
+                var chunks = in[chunk_length..];
+                while (chunks.len > 0) {
+                    const chunk = chunks[0..@min(chunk_length, chunks.len)];
+                    chunks = chunks[chunk.len..];
+                    var cv: [chaining_value_length]u8 = undefined;
+                    var d = d0;
+                    absorb(&d, chunk, 4);
+                    d.squeeze(&cv);
+                    root.update(&cv);
+                }
+                root.final(last_trailer);
+            }
+
+            self.offset = 0;
+            self.squeeze(out);
+        }
+
+        /// Squeeze more bytes after a call to `duplex`.
+        pub fn squeeze(self: *Self, out: []u8) void {
+            @memset(out, 0);
+            self.xor(out, out);
+        }
+
+        /// Like `squeeze`, but XOR the output with `in`.
+        /// `out` and `in` have the same length, and can be the same buffer.
+        pub fn xor(self: *Self, out: []u8, in: []const u8) void {
+            assert(out.len == in.len);
+            assert(self.offset != no_output);
+            assert(in.len < no_output - self.offset);
+
+            var i: usize = 0;
+            if (self.offset < block_length) {
+                i = @min(block_length - self.offset, in.len);
+                self.d.xor(out[0..i], in[0..i]);
+                self.offset += i;
+            }
+            const used: usize = @intCast(self.offset % block_length);
+            if (used != 0 and i < in.len) {
+                const n = @min(block_length - used, in.len - i);
+                xorBytes(out[i..][0..n], in[i..][0..n], self.block[used..][0..n]);
+                self.offset += n;
+                i += n;
+            }
+
+            if (i == in.len) return;
+
+            // After the first block, each block comes from a compact clone that absorbed its index.
+            var counter: [block_length]u8 = @splat(0);
+            while (i < in.len) {
+                const left = in.len - i;
+                mem.writeInt(u64, counter[0..8], self.offset / block_length, .little);
+                var d = self.d.cloneCompact();
+                d.duplex(&.{}, &counter, 2);
+                const n = @min(block_length, left);
+                if (n == block_length) {
+                    d.xor(out[i..][0..n], in[i..][0..n]);
+                } else {
+                    d.squeeze(&self.block);
+                    xorBytes(out[i..], in[i..], self.block[0..n]);
+                }
+                self.offset += n;
+                i += n;
+            }
+        }
+
+        /// Absorb a string block by block. The last block gets `last_trailer`.
+        fn absorb(d: *Duplex, in: []const u8, last_trailer: Duplex.Trailer) void {
+            var left = in;
+            while (left.len > block_length) : (left = left[block_length..]) {
+                d.duplex(&.{}, left[0..block_length], 1);
+            }
+            d.duplex(&.{}, left, last_trailer);
+        }
+
+        /// Like `absorb`, for a string that comes in pieces.
+        const Root = struct {
+            d: *Duplex,
+            buf: [block_length]u8 = undefined,
+            len: usize = 0,
+
+            fn update(self: *Root, bytes: []const u8) void {
+                var left = bytes;
+                if (left.len == 0) return;
+
+                // Hold on to a block until we know it isn't the last one.
+                if (self.len > 0) {
+                    const n = @min(block_length - self.len, left.len);
+                    @memcpy(self.buf[self.len..][0..n], left[0..n]);
+                    self.len += n;
+                    left = left[n..];
+                    if (left.len == 0) return;
+                    self.d.duplex(&.{}, &self.buf, 1);
+                }
+                while (left.len > block_length) : (left = left[block_length..]) {
+                    self.d.duplex(&.{}, left[0..block_length], 1);
+                }
+                @memcpy(self.buf[0..left.len], left);
+                self.len = left.len;
+            }
+
+            fn final(self: *Root, last_trailer: Duplex.Trailer) void {
+                self.d.duplex(&.{}, self.buf[0..self.len], last_trailer);
+            }
+        };
+    };
+}
+
 /// Append a bit to a trailer.
 fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trailer)) + 1) {
     const Extended = @Int(.unsigned, @bitSizeOf(@TypeOf(trailer)) + 1);
     assert(trailer != 0);
     const end = @as(Extended, 1) << math.log2_int(@TypeOf(trailer), trailer);
     return trailer + (end << bit);
+}
+
+/// XOR `in` with `key` into `out`. `out` and `in` can be the same buffer.
+fn xorBytes(out: []u8, in: []const u8, key: []const u8) void {
+    assert(out.len == in.len and out.len == key.len);
+
+    // A plain loop over the three slices stays slow when `out` is `in`.
+    var i: usize = 0;
+    while (i + 8 <= out.len) : (i += 8) {
+        const x = mem.readInt(u64, in[i..][0..8], native_endian) ^ mem.readInt(u64, key[i..][0..8], native_endian);
+        mem.writeInt(u64, out[i..][0..8], x, native_endian);
+    }
+    while (i < out.len) : (i += 1) out[i] = in[i] ^ key[i];
 }
 
 test {
