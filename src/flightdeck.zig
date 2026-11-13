@@ -336,3 +336,104 @@ fn xorBytes(out: []u8, in: []const u8, key: []const u8) void {
 test {
     _ = @import("flightdeck_test.zig");
 }
+
+// FlightDeck as written in Algorithm 3 of the paper.
+fn ReferenceFlightDeck(comptime Duplex: type, comptime alpha: usize, comptime c: usize) type {
+    const rho = Duplex.block_length;
+
+    return struct {
+        const Self = @This();
+
+        d: Duplex,
+        d_squeeze: Duplex = undefined,
+        o: usize = undefined,
+
+        fn duplexing(self: *Self, allocator: mem.Allocator, z: []u8, x: []const u8, e: u5) !void {
+            var r: std.ArrayList(u8) = .empty;
+            defer r.deinit(allocator);
+
+            try r.appendSlice(allocator, x[0..@min(alpha, x.len)]);
+            var i: usize = alpha;
+            while (i < x.len) : (i += alpha) {
+                var y = x[i..@min(i + alpha, x.len)];
+                var d_prime = self.d.cloneCompact();
+                while (y.len > rho) : (y = y[rho..]) d_prime.duplex(&.{}, y[0..rho], 1);
+                var cv: [c]u8 = undefined;
+                d_prime.duplex(&cv, y, 4);
+                try r.appendSlice(allocator, &cv);
+            }
+            var left = r.items;
+            while (left.len > rho) : (left = left[rho..]) self.d.duplex(&.{}, left[0..rho], 1);
+            // E||1
+            self.d.duplex(&.{}, left, @as(u6, e) + (@as(u6, 2) << math.log2_int(u5, e)));
+            self.o = 0;
+            self.squeezing(z);
+        }
+
+        fn squeezing(self: *Self, z: []u8) void {
+            var done: usize = 0;
+            if (self.o <= rho) {
+                done = @min(rho - self.o, z.len);
+                self.d.squeeze(z[0..done]);
+                self.o += done;
+            }
+            while (done < z.len) {
+                if (self.o % rho == 0) {
+                    var counter: [rho]u8 = @splat(0);
+                    mem.writeInt(u64, counter[0..8], self.o / rho, .little);
+                    self.d_squeeze = self.d.cloneCompact();
+                    self.d_squeeze.duplex(&.{}, &counter, 2);
+                }
+                const n = @min(rho - self.o % rho, z.len - done);
+                self.d_squeeze.squeeze(z[done..][0..n]);
+                self.o += n;
+                done += n;
+            }
+        }
+    };
+}
+
+test "FlightDeck against the reference algorithm" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        .{ TurboShake128Duplex, 5120, 32 },
+        // Chunks that don't end on a block boundary, chaining values that don't end on a lane boundary.
+        .{ TurboShake128Duplex, 327, 13 },
+        // One block per chunk, chaining values as long as a block.
+        .{ TurboShake256Duplex, 128, 128 },
+    }) |parameters| {
+        const Duplex, const alpha, const c = parameters;
+        const rho = Duplex.block_length;
+
+        var reference: ReferenceFlightDeck(Duplex, alpha, c) = .{ .d = .init("key") };
+        var deck: FlightDeck(Duplex, alpha, c) = .init("key");
+
+        const in = try allocator.alloc(u8, 18 * alpha + rho + 1);
+        defer allocator.free(in);
+        for (in, 0..) |*b, i| b.* = @truncate(5 * i + 1);
+        var expected: [20 * rho]u8 = undefined;
+        var out: [expected.len]u8 = undefined;
+
+        var prng: std.Random.DefaultPrng = .init(alpha);
+        const random = prng.random();
+
+        // Lengths around every multiple of half a chunk.
+        for (0..37) |half_chunks| {
+            for ([_]usize{ 0, 1, 2, rho + 1, rho + 2 }) |extra| {
+                const x = in[0..half_chunks * alpha / 2 + extra -| 1];
+                const trailer = random.intRangeAtMost(u5, 1, 31);
+                const z = out[0..random.uintAtMost(usize, out.len)];
+                const second = random.uintAtMost(usize, z.len);
+                const first = random.uintAtMost(usize, second);
+
+                try reference.duplexing(allocator, expected[0..z.len], x, trailer);
+                // The same output, in three pieces.
+                deck.duplex(z[0..first], x, trailer);
+                deck.squeeze(z[first..second]);
+                deck.squeeze(z[second..]);
+                try std.testing.expectEqualSlices(u8, expected[0..z.len], z);
+            }
+        }
+    }
+}
