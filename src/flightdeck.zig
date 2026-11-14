@@ -443,12 +443,42 @@ fn FlightDeckBatched(
             if (i == in.len) return;
 
             // After the first block, each block comes from a compact clone that absorbed its index.
-            var counter: [block_length]u8 = @splat(0);
-            while (i < in.len) {
+            var counters: [max_batch_size][block_length]u8 = @splat(@splat(0));
+            batches: while (i < in.len) {
                 const left = in.len - i;
-                mem.writeInt(u64, counter[0..8], self.offset / block_length, .little);
+                const index = self.offset / block_length;
+                const needed = (left - 1) / block_length + 1;
+
+                if (needed >= 2) inline for (batch_sizes) |n| {
+                    if (needed <= n or n == max_batch_size) {
+                        var blocks: [n]*const [block_length]u8 = undefined;
+                        inline for (&blocks, counters[0..n], 0..) |*block, *counter, j| {
+                            mem.writeInt(u64, counter[0..8], index + j, .little);
+                            block.* = counter;
+                        }
+                        var clones: Duplex.Parallel(n) = .init(&self.d);
+                        clones.duplex(block_length, blocks, 2);
+
+                        const batch_length = n * block_length;
+                        if (left >= batch_length) {
+                            clones.xor(block_length, out[i..][0..batch_length], in[i..][0..batch_length]);
+                            self.offset += batch_length;
+                            i += batch_length;
+                        } else {
+                            var batch: [batch_length]u8 = undefined;
+                            clones.squeeze(block_length, &batch);
+                            xorBytes(out[i..], in[i..], batch[0..left]);
+                            self.block = batch[(needed - 1) * block_length ..][0..block_length].*;
+                            self.offset += left;
+                            i += left;
+                        }
+                        continue :batches;
+                    }
+                };
+
+                mem.writeInt(u64, counters[0][0..8], index, .little);
                 var d = self.d.cloneCompact();
-                d.duplex(&.{}, &counter, 2);
+                d.duplex(&.{}, &counters[0], 2);
                 const n = @min(block_length, left);
                 if (n == block_length) {
                     d.xor(out[i..][0..n], in[i..][0..n]);
