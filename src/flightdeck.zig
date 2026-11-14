@@ -1,4 +1,4 @@
-//! FlightDeck, a deck cipher built on a duplex cipher.
+//! FlightDeck, a deck cipher that processes long inputs and long outputs in parallel.
 //!
 //! A deck cipher has a key, takes a sequence of strings of any length, and can return any number of bytes after each of them.
 //! These bytes depend on the key and on all the strings so far.
@@ -16,9 +16,14 @@ const crypto = std.crypto;
 const math = std.math;
 const mem = std.mem;
 
+const simd = std.simd;
+
 const native_endian = @import("builtin").cpu.arch.endian();
 
 const KeccakF = crypto.core.keccak.KeccakF;
+
+/// How many Keccak states to process at once.
+const max_parallelism = simd.suggestVectorLength(u64) orelse 1;
 
 /// SHAKE128-FlightDeck, with 128 bits of security.
 pub const Shake128FlightDeck = FlightDeck(Shake128Duplex, 5120, 32);
@@ -62,6 +67,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         const Self = @This();
 
         const Permutation = KeccakF(1600);
+        const block_lanes = block_length / 8;
 
         /// How many bytes a call can absorb, and how many it can return.
         pub const block_length: comptime_int = Permutation.block_bytes - 8 - security_level / 4;
@@ -145,6 +151,118 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
             }
             self.offset += in.len;
         }
+
+        /// `n` compact clones of a duplex cipher, all processed together using vectors.
+        /// `FlightDeck` uses this to go faster, if the duplex type has it.
+        /// `n` is a power of two.
+        pub fn Parallel(comptime n: comptime_int) type {
+            comptime assert(n >= 2 and math.isPowerOfTwo(n));
+
+            return struct {
+                const Clones = @This();
+
+                st: [25]@Vector(n, u64),
+
+                /// Make `n` compact clones of `d`.
+                pub fn init(d: *const Self) Clones {
+                    var self: Clones = undefined;
+                    inline for (&self.st, d.st.st, 0..) |*lanes, lane, i| {
+                        lanes.* = @splat(if (i < block_lanes) 0 else lane);
+                    }
+                    return self;
+                }
+
+                /// A compact clone of the clone `i`.
+                pub fn get(self: *const Clones, i: usize) Self {
+                    var d: Self = .{};
+                    inline for (&d.st.st, self.st) |*lane, lanes| lane.* = @as([n]u64, lanes)[i];
+                    return d;
+                }
+
+                /// Make each clone absorb its own block of `len` bytes.
+                pub inline fn duplex(self: *Clones, comptime len: usize, blocks: [n]*const [len]u8, trailer: Trailer) void {
+                    comptime assert(len <= block_length);
+
+                    if (len == block_length) {
+                        self.overwrite(blocks);
+                    } else {
+                        var padded: [n][block_length]u8 = @splat(@splat(0));
+                        var padded_blocks: [n]*const [block_length]u8 = undefined;
+                        inline for (&padded, &padded_blocks, blocks) |*buf, *padded_block, block| {
+                            buf[0..len].* = block.*;
+                            buf[len] = 0x01;
+                            padded_block.* = buf;
+                        }
+                        self.overwrite(padded_blocks);
+                    }
+                    const d: u64 = appendBit(trailer, @intFromBool(len == block_length));
+                    self.st[block_lanes] ^= @splat(d | (@as(u64, padding) << 56));
+                    permute(n, rounds, &self.st);
+                }
+
+                /// Squeeze `len` bytes from each clone, one clone after the other.
+                pub fn squeeze(self: *const Clones, comptime len: usize, out: *[n * len]u8) void {
+                    self.output(len, out, null);
+                }
+
+                /// Like `squeeze`, but XOR the output with `in`. They can be the same buffer.
+                pub fn xor(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
+                    self.output(len, out, in);
+                }
+
+                /// A vector of the state holds the same lane of every clone, but a block holds consecutive lanes of a single clone.
+                /// So load the blocks as rows, and transpose them.
+                inline fn overwrite(self: *Clones, blocks: [n]*const [block_length]u8) void {
+                    @setEvalBranchQuota(100_000);
+                    comptime var from = 0;
+                    inline while (from < block_lanes) : (from += n) {
+                        const count: comptime_int = @min(n, block_lanes - from);
+                        var rows: [n]@Vector(n, u64) = undefined;
+                        inline for (&rows, blocks) |*row, block| {
+                            var lanes: [n]u64 = @splat(0);
+                            lanes[0..count].* = mem.littleToNative(@Vector(count, u64), mem.bytesToValue([count]u64, block[8 * from ..][0 .. 8 * count]));
+                            row.* = lanes;
+                        }
+                        transpose(n, &rows);
+                        self.st[from..][0..count].* = rows[0..count].*;
+                    }
+                }
+
+                /// The reverse of `overwrite`.
+                inline fn output(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: ?*const [n * len]u8) void {
+                    comptime assert(len <= block_length);
+                    @setEvalBranchQuota(100_000);
+
+                    comptime var from = 0;
+                    inline while (8 * from < len) : (from += n) {
+                        const count: comptime_int = @min(n, block_lanes - from);
+                        const size: comptime_int = @min(8 * count, len - 8 * from);
+                        var rows: [n]@Vector(n, u64) = @splat(@splat(0));
+                        rows[0..count].* = self.st[from..][0..count].*;
+                        transpose(n, &rows);
+                        inline for (rows, 0..) |row, i| {
+                            const at = i * len + 8 * from;
+                            const whole = size / 8;
+                            const lanes: [n]u64 = row;
+                            if (whole > 0) {
+                                const bytes = out[at..][0 .. 8 * whole];
+                                const Part = @Vector(whole, u64);
+                                var part: Part = lanes[0..whole].*;
+                                if (in) |src| part ^= mem.littleToNative(Part, mem.bytesToValue([whole]u64, src[at..][0 .. 8 * whole]));
+                                mem.bytesAsValue([whole]u64, bytes).* = mem.nativeToLittle(Part, part);
+                            }
+                            if (size % 8 != 0) {
+                                var last: [8]u8 = undefined;
+                                mem.writeInt(u64, &last, lanes[whole], .little);
+                                inline for (at + 8 * whole..at + size, 0..) |k, j| {
+                                    out[k] = last[j] ^ if (in) |src| src[k] else 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+        }
     };
 }
 
@@ -155,10 +273,23 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 /// Copy an instance to clone it.
 ///
 /// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`.
+/// It doesn't have to come with `Parallel`.
 /// Long inputs are cut into chunks of `chunk_length` bytes, and each chunk is summed up in `chaining_value_length` bytes.
 pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime chaining_value_length: usize) type {
+    return FlightDeckBatched(Duplex, chunk_length, chaining_value_length, max_parallelism);
+}
+
+/// FlightDeck, processing up to `parallelism` Keccak states at once.
+/// The output doesn't depend on that number.
+fn FlightDeckBatched(
+    comptime Duplex: type,
+    comptime chunk_length: usize,
+    comptime chaining_value_length: usize,
+    comptime parallelism: comptime_int,
+) type {
     const block_length = Duplex.block_length;
 
+    comptime assert(parallelism >= 1);
     comptime assert(chunk_length > 0);
     comptime assert(chaining_value_length > 0 and chaining_value_length <= block_length);
     // Output blocks are numbered with a 64-bit integer, and that has to fit in a block.
@@ -167,6 +298,16 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
     return struct {
         const Self = @This();
 
+        /// How many chunks, or output blocks, can be processed at once.
+        const batch_sizes: []const comptime_int = if (@hasDecl(Duplex, "Parallel")) switch (parallelism) {
+            1 => &.{},
+            2, 3 => &.{2},
+            4...7 => &.{ 2, 4 },
+            else => &.{ 2, 4, 8 },
+        } else &.{};
+        const max_batch_size = if (batch_sizes.len == 0) 1 else batch_sizes[batch_sizes.len - 1];
+        const blocks_per_chunk = (chunk_length - 1) / block_length + 1;
+        const last_block_length = (chunk_length - 1) % block_length + 1;
         const no_output = math.maxInt(u64);
 
         /// Recommended key length, in bytes.
@@ -204,8 +345,58 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
                 // Every chunk after the first one starts from this state.
                 const d0 = self.d.cloneCompact();
                 var root: Root = .{ .d = &self.d };
-                root.update(in[0..chunk_length]);
-                var chunks = in[chunk_length..];
+                var chunks = in;
+                var first = true;
+
+                batches: while (true) {
+                    const full = chunks.len / chunk_length;
+                    // A shorter last chunk can join a batch, except for its last block.
+                    const tail_blocks = (chunks.len % chunk_length -| 1) / block_length;
+                    // A batch doesn't have to be full to be worth it.
+                    // A shorter last chunk only calls for a bigger batch if it is at least half a chunk.
+                    const wanted = full + @intFromBool(2 * tail_blocks >= blocks_per_chunk);
+                    if (wanted < 2) break;
+
+                    inline for (batch_sizes) |n| {
+                        if (wanted <= n or n == max_batch_size) {
+                            const count = @min(full, n);
+                            const tail_length = if (count == full and count < n) tail_blocks * block_length else 0;
+                            var tail: Duplex = undefined;
+
+                            var clones: Duplex.Parallel(n) = .init(&d0);
+                            var done: usize = 0;
+                            while (true) : (done += block_length) {
+                                if (tail_length != 0 and done == tail_length) tail = clones.get(count);
+                                if (done == chunk_length - last_block_length) break;
+                                clones.duplex(block_length, blocksOf(n, block_length, chunks, count, tail_length, done), 1);
+                            }
+                            if (first) {
+                                // The first clone played the main duplex, absorbing the first chunk.
+                                // The end of that chunk may share a block with chaining values.
+                                self.d = clones.get(0);
+                                root.update(chunks[done..chunk_length]);
+                            }
+                            clones.duplex(last_block_length, blocksOf(n, last_block_length, chunks, count, tail_length, done), 4);
+
+                            var cvs: [n * chaining_value_length]u8 = undefined;
+                            clones.squeeze(chaining_value_length, &cvs);
+                            root.update(cvs[@intFromBool(first) * chaining_value_length .. count * chaining_value_length]);
+                            chunks = chunks[count * chunk_length ..];
+                            if (tail_length != 0) {
+                                tail.duplex(cvs[0..chaining_value_length], chunks[tail_length..], 4);
+                                root.update(cvs[0..chaining_value_length]);
+                                chunks = chunks[chunks.len..];
+                            }
+                            first = false;
+                            continue :batches;
+                        }
+                    }
+                    break;
+                }
+                if (first) {
+                    root.update(chunks[0..chunk_length]);
+                    chunks = chunks[chunk_length..];
+                }
                 while (chunks.len > 0) {
                     const chunk = chunks[0..@min(chunk_length, chunks.len)];
                     chunks = chunks[chunk.len..];
@@ -270,6 +461,25 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
             }
         }
 
+        /// The block of each clone, at `offset` in its chunk.
+        /// The first `count` chunks are full. The next one is in for `tail_length` bytes.
+        /// A clone with nothing to do absorbs the block of the first clone again.
+        inline fn blocksOf(
+            comptime n: comptime_int,
+            comptime len: usize,
+            chunks: []const u8,
+            count: usize,
+            tail_length: usize,
+            offset: usize,
+        ) [n]*const [len]u8 {
+            var blocks: [n]*const [len]u8 = undefined;
+            inline for (&blocks, 0..) |*block, i| {
+                const chunk = if (i < count or (i == count and offset < tail_length)) i else 0;
+                block.* = chunks[chunk * chunk_length + offset ..][0..len];
+            }
+            return blocks;
+        }
+
         /// Absorb a string block by block. The last block gets `last_trailer`.
         fn absorb(d: *Duplex, in: []const u8, last_trailer: Duplex.Trailer) void {
             var left = in;
@@ -331,6 +541,86 @@ fn xorBytes(out: []u8, in: []const u8, key: []const u8) void {
         mem.writeInt(u64, out[i..][0..8], x, native_endian);
     }
     while (i < out.len) : (i += 1) out[i] = in[i] ^ key[i];
+}
+
+/// Transpose a square matrix, given as rows.
+fn transpose(comptime n: comptime_int, rows: *[n]@Vector(n, u64)) void {
+    comptime assert(n >= 2 and math.isPowerOfTwo(n));
+    const half = n / 2;
+    const quarter = n / 4;
+
+    // Transpose every 2x2 block first.
+    // After that, elements only move in pairs, which is cheap with 128-bit registers.
+    var pairs: [2][half]@Vector(n, u64) = undefined;
+    inline for (0..half) |i| {
+        const a = simd.deinterlace(2, rows[2 * i]);
+        const b = simd.deinterlace(2, rows[2 * i + 1]);
+        pairs[0][i] = simd.interlace(.{ a[0], b[0] });
+        pairs[1][i] = simd.interlace(.{ a[1], b[1] });
+    }
+    // Then keep splitting the pairs at even and at odd positions until they are all in place.
+    inline for (&pairs) |*matrix| {
+        inline for (0..math.log2(half)) |_| {
+            const previous = matrix.*;
+            inline for (0..quarter) |i| {
+                const a = simd.deinterlace(4, previous[2 * i]);
+                const b = simd.deinterlace(4, previous[2 * i + 1]);
+                matrix[i] = simd.join(simd.interlace(.{ a[0], a[1] }), simd.interlace(.{ b[0], b[1] }));
+                matrix[i + quarter] = simd.join(simd.interlace(.{ a[2], a[3] }), simd.interlace(.{ b[2], b[3] }));
+            }
+        }
+    }
+    inline for (0..half) |i| {
+        rows[2 * i] = pairs[0][i];
+        rows[2 * i + 1] = pairs[1][i];
+    }
+}
+
+/// Keccak-p[1600] on `n` states at once. `st[i]` is the lane `i` of every state.
+inline fn permute(comptime n: comptime_int, comptime rounds: u5, st: *[25]@Vector(n, u64)) void {
+    @setEvalBranchQuota(100_000);
+    const Lanes = @Vector(n, u64);
+    const round_constants = [24]u64{
+        0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
+        0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+        0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
+        0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
+        0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
+        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+    };
+    const pi = [24]u5{
+        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+    };
+
+    for (round_constants[round_constants.len - rounds ..]) |round_constant| {
+        var t: [5]Lanes = undefined;
+        inline for (&t, 0..) |*parity, x| {
+            parity.* = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
+        }
+        inline for (0..5) |x| {
+            const d = t[(x + 4) % 5] ^ math.rotl(Lanes, t[(x + 1) % 5], 1);
+            inline for (0..5) |y| st[5 * y + x] ^= d;
+        }
+
+        var last = st[1];
+        comptime var rotation = 0;
+        inline for (pi, 1..) |x, i| {
+            rotation = (rotation + i) % 64;
+            const next = st[x];
+            st[x] = math.rotl(Lanes, last, rotation);
+            last = next;
+        }
+
+        inline for (0..5) |y| {
+            const row = st[5 * y ..][0..5];
+            t = row.*;
+            inline for (row, 0..) |*lanes, x| {
+                lanes.* = t[x] ^ (~t[(x + 1) % 5] & t[(x + 2) % 5]);
+            }
+        }
+
+        st[0] ^= @splat(round_constant);
+    }
 }
 
 test {
@@ -407,7 +697,13 @@ test "FlightDeck against the reference algorithm" {
         const rho = Duplex.block_length;
 
         var reference: ReferenceFlightDeck(Duplex, alpha, c) = .{ .d = .init("key") };
-        var deck: FlightDeck(Duplex, alpha, c) = .init("key");
+        // Every batch size, including the ones the target wouldn't pick.
+        var decks: struct {
+            FlightDeckBatched(Duplex, alpha, c, 1),
+            FlightDeckBatched(Duplex, alpha, c, 2),
+            FlightDeckBatched(Duplex, alpha, c, 4),
+            FlightDeckBatched(Duplex, alpha, c, 8),
+        } = .{ .init("key"), .init("key"), .init("key"), .init("key") };
 
         const in = try allocator.alloc(u8, 18 * alpha + rho + 1);
         defer allocator.free(in);
@@ -418,7 +714,7 @@ test "FlightDeck against the reference algorithm" {
         var prng: std.Random.DefaultPrng = .init(alpha);
         const random = prng.random();
 
-        // Lengths around every multiple of half a chunk.
+        // Lengths around every multiple of half a chunk, where the way chunks are batched changes.
         for (0..37) |half_chunks| {
             for ([_]usize{ 0, 1, 2, rho + 1, rho + 2 }) |extra| {
                 const x = in[0..half_chunks * alpha / 2 + extra -| 1];
@@ -429,10 +725,12 @@ test "FlightDeck against the reference algorithm" {
 
                 try reference.duplexing(allocator, expected[0..z.len], x, trailer);
                 // The same output, in three pieces.
-                deck.duplex(z[0..first], x, trailer);
-                deck.squeeze(z[first..second]);
-                deck.squeeze(z[second..]);
-                try std.testing.expectEqualSlices(u8, expected[0..z.len], z);
+                inline for (&decks) |*deck| {
+                    deck.duplex(z[0..first], x, trailer);
+                    deck.squeeze(z[first..second]);
+                    deck.squeeze(z[second..]);
+                    try std.testing.expectEqualSlices(u8, expected[0..z.len], z);
+                }
             }
         }
     }
