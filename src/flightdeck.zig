@@ -3,12 +3,13 @@
 //! A deck cipher has a key, takes a sequence of strings of any length, and can return any number of bytes after each of them.
 //! These bytes depend on the key and on all the strings so far.
 //!
-//! There are two layers:
+//! There are three layers:
 //! - `OverwriteDuplex`: a duplex cipher, as secure as (Turbo)SHAKE.
 //! - `FlightDeck`: a deck cipher on top of a duplex cipher.
+//! - `DeckBo`: authenticated encryption on top of a deck cipher.
 //!
 //! FlightDeck: https://eprint.iacr.org/2026/2801
-//! Overwrite duplex: https://eprint.iacr.org/2024/1618
+//! Overwrite duplex and Deck-BO: https://eprint.iacr.org/2024/1618
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +21,7 @@ const simd = std.simd;
 
 const native_endian = @import("builtin").cpu.arch.endian();
 
+const AuthenticationError = crypto.errors.AuthenticationError;
 const KeccakF = crypto.core.keccak.KeccakF;
 
 /// How many Keccak states to process at once.
@@ -44,6 +46,30 @@ pub const Shake256Duplex = OverwriteDuplex(256, 24, 0x9f);
 pub const TurboShake128Duplex = OverwriteDuplex(128, 12, 0x80);
 /// The overwrite duplex that is as secure as TurboSHAKE256.
 pub const TurboShake256Duplex = OverwriteDuplex(256, 12, 0x80);
+
+/// SHAKE128-BO authenticated encryption, with 128 bits of security.
+/// See `DeckBo` for the tag length, in bytes. 16 or 32 are good choices.
+pub fn Shake128Bo(comptime tag_length: usize) type {
+    return DeckBo(Shake128FlightDeck, tag_length);
+}
+
+/// SHAKE256-BO authenticated encryption, with 256 bits of security.
+/// See `DeckBo` for the tag length, in bytes. 32 or 64 are good choices.
+pub fn Shake256Bo(comptime tag_length: usize) type {
+    return DeckBo(Shake256FlightDeck, tag_length);
+}
+
+/// TurboSHAKE128-BO authenticated encryption, with 128 bits of security.
+/// See `DeckBo` for the tag length, in bytes. 16 or 32 are good choices.
+pub fn TurboShake128Bo(comptime tag_length: usize) type {
+    return DeckBo(TurboShake128FlightDeck, tag_length);
+}
+
+/// TurboSHAKE256-BO authenticated encryption, with 256 bits of security.
+/// See `DeckBo` for the tag length, in bytes. 32 or 64 are good choices.
+pub fn TurboShake256Bo(comptime tag_length: usize) type {
+    return DeckBo(TurboShake256FlightDeck, tag_length);
+}
 
 /// The overwrite duplex construction, on top of Keccak-p[1600].
 ///
@@ -549,6 +575,89 @@ fn FlightDeckBatched(
                 self.d.duplex(&.{}, self.buf[0..self.len], last_trailer);
             }
         };
+    };
+}
+
+/// The Deck-BO authenticated encryption mode, on top of a deck cipher such as `FlightDeck`.
+///
+/// An instance is a session.
+/// Each message is authenticated along with all the ones before it, so both sides have to go through the same messages in the same order.
+/// Copy an instance to fork a session.
+///
+/// There is no nonce.
+/// So the same message, after the same messages and with the same associated data, gets the same ciphertext.
+/// If that's a problem, put a nonce or a counter in the associated data.
+///
+/// `tag_length` is in bytes.
+/// A forgery succeeds with probability 2^-(8 * tag_length).
+/// A tag twice as long as the security level, 32 bytes for 128 bits, also commits to the key, the associated data and the message.
+pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
+    comptime assert(tag_length_ > 0);
+
+    return struct {
+        const Self = @This();
+
+        /// Length of the authentication tag, in bytes.
+        pub const tag_length = tag_length_;
+        /// Recommended key length, in bytes.
+        pub const key_length = Deck.key_length;
+        /// Maximum key length, in bytes.
+        pub const key_length_max = Deck.key_length_max;
+
+        deck: Deck,
+
+        /// Start a session with a key of up to `key_length_max` bytes.
+        pub fn init(key: []const u8) Self {
+            return .{ .deck = .init(key) };
+        }
+
+        /// Encrypt the next message of the session.
+        /// `c`: ciphertext, same length as `m`. They can be the same buffer.
+        /// `tag`: authentication tag
+        /// `m`: message
+        /// `ad`: associated data
+        pub fn encrypt(self: *Self, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8) void {
+            assert(c.len == m.len);
+
+            if (m.len == 0) {
+                self.deck.duplex(tag, ad, 4);
+                return;
+            }
+            if (ad.len != 0) self.deck.duplex(&.{}, ad, 5);
+            var keystream = self.deck.cloneCompact();
+            self.deck.duplex(tag, m, 14);
+            keystream.duplex(&.{}, tag, 13);
+            keystream.xor(c, m);
+        }
+
+        /// Decrypt the next message of the session.
+        /// `m`: message, same length as `c`. They can be the same buffer.
+        /// `c`: ciphertext
+        /// `tag`: authentication tag
+        /// `ad`: associated data
+        ///
+        /// If the tag doesn't match, `m` is zeroed and the session stays as it was.
+        pub fn decrypt(self: *Self, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8) AuthenticationError!void {
+            assert(c.len == m.len);
+
+            var deck = self.deck.cloneCompact();
+            var computed_tag: [tag_length]u8 = undefined;
+            if (c.len == 0) {
+                deck.duplex(&computed_tag, ad, 4);
+            } else {
+                if (ad.len != 0) deck.duplex(&.{}, ad, 5);
+                var keystream = deck.cloneCompact();
+                keystream.duplex(&.{}, &tag, 13);
+                keystream.xor(m, c);
+                deck.duplex(&computed_tag, m, 14);
+            }
+            if (!crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
+                crypto.secureZero(u8, &computed_tag);
+                crypto.secureZero(u8, m);
+                return error.AuthenticationFailed;
+            }
+            self.deck = deck;
+        }
     };
 }
 
