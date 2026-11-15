@@ -1,5 +1,6 @@
 const std = @import("std");
 const crypto = std.crypto;
+const mem = std.mem;
 const testing = std.testing;
 
 const flightdeck = @import("flightdeck.zig");
@@ -12,6 +13,8 @@ const Shake128FlightDeck = flightdeck.Shake128FlightDeck;
 const Shake256FlightDeck = flightdeck.Shake256FlightDeck;
 const TurboShake128FlightDeck = flightdeck.TurboShake128FlightDeck;
 const TurboShake256FlightDeck = flightdeck.TurboShake256FlightDeck;
+const TurboShake128Bo = flightdeck.TurboShake128Bo;
+const TurboShake256Bo = flightdeck.TurboShake256Bo;
 
 // The inputs of the test vectors.
 fn fillPattern(buf: []u8, multiplier: usize, offset: usize) void {
@@ -142,4 +145,113 @@ test "FlightDeck test vectors" {
             try testing.expectEqualSlices(u8, &end, out[out_len - 32 .. out_len]);
         }
     }
+}
+
+test "DeckBo test vectors" {
+    const Vectors = struct {
+        // Ciphertext and tag of each message of a session.
+        session: [4][]const u8,
+        // End of the ciphertext of a long message, and its tag.
+        long_ciphertext: *const [64:0]u8,
+        long_tag: *const [64:0]u8,
+    };
+    // Generated with XKCP.
+    const vectors = [_]Vectors{
+        .{
+            .session = .{
+                "1c106e7483215251a6d39d1b7ced5081",
+                "a1ee10ab51029ad2520e746fa3616d10",
+                "c0e75ee6dbd1815bace517f6e80e78c4fe8de69c68",
+                "fd79fad9b021cf4e7d5e2f8a45a5fec28b5d267ff026b830e3636a05424870a0589dc31a036457f4b2ffa678aeb4742fcd8b280e257586cc",
+            },
+            .long_ciphertext = "448ad0859b25d898a569dbc54e9f10a7845a2085334be423dd62081236ef3477",
+            .long_tag = "bfea226043c96f981d2a87ec6b595fd7517fca51190b24c87aaa4b4f46285baf",
+        },
+        .{
+            .session = .{
+                "50a6969d91e4a3cf6cbab92862e5331d",
+                "50ca4c773b1fae7dd184da8e1a57cb11",
+                "aaa5df8bcbfdc6e371c38b184644023fe70204d650",
+                "f045a1839d595957f5719040ee4ede0d6739e3661ff96bba0115410180fb8429c3b39f2085e9192d5b82af48bbc2ebc63f552116f9d440ff",
+            },
+            .long_ciphertext = "8f73baf8369dbd41a3b5d2d90952d136150794452602586aeb99e98c4af29c20",
+            .long_tag = "e531fa17ca00de8db462ddfe079be91e2e55d0b06ea72932f7ecffe19255c3aa",
+        },
+    };
+
+    inline for (.{ TurboShake128Bo, TurboShake256Bo }, vectors) |Aead, expected| {
+        var key: [32]u8 = undefined;
+        for (&key, 0..) |*b, i| b.* = @intCast(i);
+
+        // Four messages, with and without associated data and plaintext.
+        var sender: Aead(16) = .init(key[0..16]);
+        var receiver = sender;
+        inline for (.{ 0, 5, 0, 7 }, .{ 0, 0, 5, 40 }, expected.session, 0..) |ad_len, m_len, hex, i| {
+            var ad: [ad_len]u8 = undefined;
+            var m: [m_len]u8 = undefined;
+            fillPattern(&ad, 1, 17 * i);
+            fillPattern(&m, 3, 29 * i);
+
+            var c: [m_len]u8 = undefined;
+            var tag: [16]u8 = undefined;
+            sender.encrypt(&c, &tag, &m, &ad);
+            var c_and_tag: [m_len + 16]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&c_and_tag, hex);
+            try testing.expectEqualSlices(u8, &c_and_tag, &(c ++ tag));
+
+            var decrypted: [m_len]u8 = undefined;
+            try receiver.decrypt(&decrypted, &c, tag, &ad);
+            try testing.expectEqualSlices(u8, &m, &decrypted);
+        }
+
+        // Many chunks of associated data and of plaintext, encrypted and decrypted in place.
+        var ad: [20000]u8 = undefined;
+        var m: [80000]u8 = undefined;
+        fillPattern(&ad, 1, 0);
+        fillPattern(&m, 3, 0);
+        var aead: Aead(32) = .init(&key);
+        const fresh = aead;
+        var tag: [32]u8 = undefined;
+        aead.encrypt(&m, &tag, &m, &ad);
+
+        var c_end: [32]u8 = undefined;
+        var long_tag: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&c_end, expected.long_ciphertext);
+        _ = try std.fmt.hexToBytes(&long_tag, expected.long_tag);
+        try testing.expectEqualSlices(u8, &c_end, m[m.len - 32 ..]);
+        try testing.expectEqualSlices(u8, &long_tag, &tag);
+
+        aead = fresh;
+        try aead.decrypt(&m, &m, tag, &ad);
+        var plaintext: [m.len]u8 = undefined;
+        fillPattern(&plaintext, 3, 0);
+        try testing.expectEqualSlices(u8, &plaintext, &m);
+    }
+}
+
+test "DeckBo authentication failure" {
+    const Aead = TurboShake128Bo(16);
+    const m = "a message";
+    const ad = "associated data";
+
+    var sender: Aead = .init("key");
+    var receiver = sender;
+    var c: [m.len]u8 = undefined;
+    var tag: [Aead.tag_length]u8 = undefined;
+    sender.encrypt(&c, &tag, m, ad);
+
+    var out: [m.len]u8 = undefined;
+    var bad_tag = tag;
+    bad_tag[0] ^= 1;
+    try testing.expectError(error.AuthenticationFailed, receiver.decrypt(&out, &c, bad_tag, ad));
+    try testing.expect(mem.allEqual(u8, &out, 0));
+    var bad_c = c;
+    bad_c[0] ^= 1;
+    try testing.expectError(error.AuthenticationFailed, receiver.decrypt(&out, &bad_c, tag, ad));
+    try testing.expectError(error.AuthenticationFailed, receiver.decrypt(&out, &c, tag, "other data"));
+
+    // The session didn't move: the message is still accepted, but only once.
+    try receiver.decrypt(&out, &c, tag, ad);
+    try testing.expectEqualSlices(u8, m, &out);
+    try testing.expectError(error.AuthenticationFailed, receiver.decrypt(&out, &c, tag, ad));
 }
