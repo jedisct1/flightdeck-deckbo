@@ -737,5 +737,5 @@ inline fn permute(comptime n: comptime_int, comptime rounds: u5, st: *[25]@Vecto
 }
 
 test {
-    _ = @import("flightdeck_test.zig");
+    _ = @import("tests/flightdeck.zig");
 }

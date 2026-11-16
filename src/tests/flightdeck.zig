@@ -4,7 +4,7 @@ const math = std.math;
 const mem = std.mem;
 const testing = std.testing;
 
-const flightdeck = @import("flightdeck.zig");
+const flightdeck = @import("../flightdeck.zig");
 const FlightDeck = flightdeck.FlightDeck;
 const Shake128Duplex = flightdeck.Shake128Duplex;
 const Shake256Duplex = flightdeck.Shake256Duplex;
