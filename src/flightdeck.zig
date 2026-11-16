@@ -789,7 +789,7 @@ test "FlightDeck against the reference algorithm" {
         var expected: [20 * rho]u8 = undefined;
         var out: [expected.len]u8 = undefined;
 
-        var prng: std.Random.DefaultPrng = .init(alpha);
+        var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
         const random = prng.random();
 
         // Lengths around every multiple of half a chunk, where the way chunks are batched changes.
