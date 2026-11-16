@@ -83,7 +83,6 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         const Self = @This();
 
         const Permutation = KeccakF(1600);
-        const block_lanes = block_length / 8;
 
         /// Maximum length of a block, and of the output of a call, in bytes.
         pub const block_length: comptime_int = Permutation.block_bytes - 8 - security_level / 4;
@@ -173,119 +172,131 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
         /// `n` compact clones of a duplex cipher, processed together using vectors. `n` is a power of two.
         pub fn Parallel(comptime n: comptime_int) type {
-            comptime assert(n >= 2 and math.isPowerOfTwo(n));
-
-            return struct {
-                const Clones = @This();
-
-                st: [25]@Vector(n, u64),
-
-                /// Make `n` compact clones of `d`.
-                pub fn init(d: *const Self) Clones {
-                    var self: Clones = undefined;
-                    inline for (&self.st, d.st.st, 0..) |*lanes, lane, i| {
-                        lanes.* = @splat(if (i < block_lanes) 0 else lane);
-                    }
-                    return self;
-                }
-
-                /// The clone `i`, as a duplex cipher of its own.
-                pub fn get(self: *const Clones, i: usize) Self {
-                    var d: Self = .{ .offset = 0 };
-                    inline for (&d.st.st, self.st) |*lane, lanes| {
-                        const clones: [n]u64 = lanes;
-                        lane.* = clones[i];
-                    }
-                    return d;
-                }
-
-                /// Make each clone absorb its own block.
-                /// Inlined so that the states stay in registers from one block to the next.
-                pub inline fn duplex(self: *Clones, comptime len: usize, blocks: [n]*const [len]u8, trailer: Trailer) void {
-                    comptime assert(len <= block_length);
-
-                    if (len == block_length) {
-                        self.overwrite(blocks);
-                    } else {
-                        var padded: [n][block_length]u8 = @splat(@splat(0));
-                        var padded_blocks: [n]*const [block_length]u8 = undefined;
-                        inline for (&padded, &padded_blocks, blocks) |*buf, *padded_block, block| {
-                            buf[0..len].* = block.*;
-                            buf[len] = 0x01;
-                            padded_block.* = buf;
-                        }
-                        self.overwrite(padded_blocks);
-                    }
-                    const first: u64 = appendBit(trailer, @intFromBool(len == block_length));
-                    const last: u64 = padding;
-                    self.st[block_lanes] ^= @splat(first | (last << 56));
-                    permute(n, rounds, &self.st);
-                }
-
-                /// Squeeze `len` bytes from each clone, one clone after the other.
-                pub fn squeeze(self: *const Clones, comptime len: usize, out: *[n * len]u8) void {
-                    self.output(len, out, null);
-                }
-
-                /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
-                pub fn xor(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
-                    self.output(len, out, in);
-                }
-
-                /// A vector of the state holds the same lane of every clone, but a block holds consecutive lanes of one clone.
-                /// So load the blocks as rows, and transpose them.
-                inline fn overwrite(self: *Clones, blocks: [n]*const [block_length]u8) void {
-                    @setEvalBranchQuota(100_000);
-                    comptime var from = 0;
-                    inline while (from < block_lanes) : (from += n) {
-                        const count: comptime_int = @min(n, block_lanes - from);
-                        var rows: [n]@Vector(n, u64) = undefined;
-                        inline for (&rows, blocks) |*row, block| {
-                            var lanes: [n]u64 = @splat(0);
-                            lanes[0..count].* = mem.littleToNative(@Vector(count, u64), mem.bytesToValue([count]u64, block[8 * from ..][0 .. 8 * count]));
-                            row.* = lanes;
-                        }
-                        transpose(n, &rows);
-                        self.st[from..][0..count].* = rows[0..count].*;
-                    }
-                }
-
-                /// The reverse of `overwrite()`.
-                inline fn output(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: ?*const [n * len]u8) void {
-                    comptime assert(len <= block_length);
-                    @setEvalBranchQuota(100_000);
-
-                    comptime var from = 0;
-                    inline while (8 * from < len) : (from += n) {
-                        const count: comptime_int = @min(n, block_lanes - from);
-                        const size: comptime_int = @min(8 * count, len - 8 * from);
-                        var rows: [n]@Vector(n, u64) = @splat(@splat(0));
-                        rows[0..count].* = self.st[from..][0..count].*;
-                        transpose(n, &rows);
-                        inline for (rows, 0..) |row, i| {
-                            const at = i * len + 8 * from;
-                            const whole = size / 8;
-                            const lanes: [n]u64 = row;
-                            if (whole > 0) {
-                                const bytes = out[at..][0 .. 8 * whole];
-                                const Part = @Vector(whole, u64);
-                                var part: Part = lanes[0..whole].*;
-                                if (in) |src| part ^= mem.littleToNative(Part, mem.bytesToValue([whole]u64, src[at..][0 .. 8 * whole]));
-                                mem.bytesAsValue([whole]u64, bytes).* = mem.nativeToLittle(Part, part);
-                            }
-                            if (size % 8 != 0) {
-                                var last: [8]u8 = undefined;
-                                mem.writeInt(u64, &last, lanes[whole], .little);
-                                inline for (at + 8 * whole..at + size, 0..) |k, j| {
-                                    out[k] = last[j] ^ if (in) |src| src[k] else 0;
-                                }
-                            }
-                        }
-                    }
-                }
-            };
+            return ParallelOverwriteDuplex(Self, n, rounds, padding);
         }
     };
+}
+
+fn ParallelOverwriteDuplex(comptime Duplex: type, comptime n: comptime_int, comptime rounds: u5, comptime padding: u8) type {
+    comptime assert(n >= 2 and math.isPowerOfTwo(n));
+
+    const block_length = Duplex.block_length;
+    const block_lanes = block_length / 8;
+
+    return struct {
+        const Self = @This();
+
+        st: [25]@Vector(n, u64),
+
+        /// Make `n` compact clones of `d`.
+        pub fn init(d: *const Duplex) Self {
+            var self: Self = undefined;
+            inline for (&self.st, d.st.st, 0..) |*lanes, lane, i| {
+                lanes.* = @splat(if (i < block_lanes) 0 else lane);
+            }
+            return self;
+        }
+
+        /// The clone `i`, as a duplex cipher of its own.
+        pub fn get(self: *const Self, i: usize) Duplex {
+            var d: Duplex = .{ .offset = 0 };
+            inline for (&d.st.st, self.st) |*lane, lanes| {
+                const clones: [n]u64 = lanes;
+                lane.* = clones[i];
+            }
+            return d;
+        }
+
+        /// Make each clone absorb its own block.
+        /// Inlined so that the states stay in registers from one block to the next.
+        pub inline fn duplex(self: *Self, comptime len: usize, blocks: [n]*const [len]u8, trailer: Duplex.Trailer) void {
+            comptime assert(len <= block_length);
+
+            if (len == block_length) {
+                self.overwrite(blocks);
+            } else {
+                var padded: [n][block_length]u8 = @splat(@splat(0));
+                var padded_blocks: [n]*const [block_length]u8 = undefined;
+                inline for (&padded, &padded_blocks, blocks) |*buf, *padded_block, block| {
+                    buf[0..len].* = block.*;
+                    buf[len] = 0x01;
+                    padded_block.* = buf;
+                }
+                self.overwrite(padded_blocks);
+            }
+            const first: u64 = appendBit(trailer, @intFromBool(len == block_length));
+            const last: u64 = padding;
+            self.st[block_lanes] ^= @splat(first | (last << 56));
+            permute(n, rounds, &self.st);
+        }
+
+        /// Squeeze `len` bytes from each clone, one clone after the other.
+        pub fn squeeze(self: *const Self, comptime len: usize, out: *[n * len]u8) void {
+            self.output(len, out, null);
+        }
+
+        /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
+        pub fn xor(self: *const Self, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
+            self.output(len, out, in);
+        }
+
+        /// A vector of the state holds the same lane of every clone, but a block holds consecutive lanes of one clone.
+        /// So load the blocks as rows, and transpose them.
+        inline fn overwrite(self: *Self, blocks: [n]*const [block_length]u8) void {
+            @setEvalBranchQuota(100_000);
+            comptime var from = 0;
+            inline while (from < block_lanes) : (from += n) {
+                const count: comptime_int = @min(n, block_lanes - from);
+                var rows: [n]@Vector(n, u64) = undefined;
+                inline for (&rows, blocks) |*row, block| {
+                    var lanes: [n]u64 = @splat(0);
+                    lanes[0..count].* = mem.littleToNative(@Vector(count, u64), mem.bytesToValue([count]u64, block[8 * from ..][0 .. 8 * count]));
+                    row.* = lanes;
+                }
+                transpose(n, &rows);
+                self.st[from..][0..count].* = rows[0..count].*;
+            }
+        }
+
+        /// The reverse of `overwrite()`.
+        inline fn output(self: *const Self, comptime len: usize, out: *[n * len]u8, in: ?*const [n * len]u8) void {
+            comptime assert(len <= block_length);
+            @setEvalBranchQuota(100_000);
+
+            comptime var from = 0;
+            inline while (8 * from < len) : (from += n) {
+                const count: comptime_int = @min(n, block_lanes - from);
+                const size: comptime_int = @min(8 * count, len - 8 * from);
+                var rows: [n]@Vector(n, u64) = @splat(@splat(0));
+                rows[0..count].* = self.st[from..][0..count].*;
+                transpose(n, &rows);
+                inline for (rows, 0..) |row, i| {
+                    const at = i * len + 8 * from;
+                    storeLanes(n, size, row, out[at..][0..size], if (in) |src| src[at..][0..size] else null);
+                }
+            }
+        }
+    };
+}
+
+/// Store the first `size` bytes of `lanes`, XORed with `in` if there is one.
+inline fn storeLanes(comptime n: comptime_int, comptime size: comptime_int, lanes: [n]u64, out: *[size]u8, in: ?*const [size]u8) void {
+    const whole = size / 8;
+    const rest = size % 8;
+    if (whole > 0) {
+        const Whole = @Vector(whole, u64);
+        var part: Whole = lanes[0..whole].*;
+        if (in) |src| part ^= mem.littleToNative(Whole, mem.bytesToValue([whole]u64, src[0 .. 8 * whole]));
+        mem.bytesAsValue([whole]u64, out[0 .. 8 * whole]).* = mem.nativeToLittle(Whole, part);
+    }
+    if (rest != 0) {
+        var last: [8]u8 = undefined;
+        mem.writeInt(u64, &last, lanes[whole], .little);
+        if (in) |src| for (last[0..rest], src[8 * whole ..]) |*b, x| {
+            b.* ^= x;
+        };
+        out[8 * whole ..].* = last[0..rest].*;
+    }
 }
 
 /// The FlightDeck deck cipher: like a duplex cipher (see `OverwriteDuplex`), with inputs and outputs of any length.
