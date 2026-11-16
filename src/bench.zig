@@ -82,6 +82,7 @@ fn kangarooTwelve(b: *Buffers(void)) void {
     mem.doNotOptimizeAway(&out);
 }
 
+/// Print the throughput of every instance, for a few message lengths.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();

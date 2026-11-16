@@ -11,14 +11,14 @@
 //! Overwrite duplex and Deck-BO: https://eprint.iacr.org/2024/1618
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const crypto = std.crypto;
 const math = std.math;
 const mem = std.mem;
-
 const simd = std.simd;
 
-const native_endian = @import("builtin").cpu.arch.endian();
+const native_endian = builtin.cpu.arch.endian();
 
 const AuthenticationError = crypto.errors.AuthenticationError;
 const KeccakF = crypto.core.keccak.KeccakF;
@@ -44,27 +44,27 @@ pub const TurboShake128Duplex = OverwriteDuplex(128, 12, 0x80);
 pub const TurboShake256Duplex = OverwriteDuplex(256, 12, 0x80);
 
 /// SHAKE128-BO, authenticated encryption with 128 bits of security.
-/// `tag_length` is in bytes, see `DeckBo`.
-pub fn Shake128Bo(comptime tag_length: usize) type {
-    return DeckBo(Shake128FlightDeck, tag_length);
+/// `tag_len` is in bytes, see `DeckBo`.
+pub fn Shake128Bo(comptime tag_len: usize) type {
+    return DeckBo(Shake128FlightDeck, tag_len);
 }
 
 /// SHAKE256-BO, authenticated encryption with 256 bits of security.
-/// `tag_length` is in bytes, see `DeckBo`.
-pub fn Shake256Bo(comptime tag_length: usize) type {
-    return DeckBo(Shake256FlightDeck, tag_length);
+/// `tag_len` is in bytes, see `DeckBo`.
+pub fn Shake256Bo(comptime tag_len: usize) type {
+    return DeckBo(Shake256FlightDeck, tag_len);
 }
 
 /// TurboSHAKE128-BO, authenticated encryption with 128 bits of security.
-/// `tag_length` is in bytes, see `DeckBo`.
-pub fn TurboShake128Bo(comptime tag_length: usize) type {
-    return DeckBo(TurboShake128FlightDeck, tag_length);
+/// `tag_len` is in bytes, see `DeckBo`.
+pub fn TurboShake128Bo(comptime tag_len: usize) type {
+    return DeckBo(TurboShake128FlightDeck, tag_len);
 }
 
 /// TurboSHAKE256-BO, authenticated encryption with 256 bits of security.
-/// `tag_length` is in bytes, see `DeckBo`.
-pub fn TurboShake256Bo(comptime tag_length: usize) type {
-    return DeckBo(TurboShake256FlightDeck, tag_length);
+/// `tag_len` is in bytes, see `DeckBo`.
+pub fn TurboShake256Bo(comptime tag_len: usize) type {
+    return DeckBo(TurboShake256FlightDeck, tag_len);
 }
 
 /// The overwrite duplex construction, on top of Keccak-p[1600].
@@ -72,7 +72,7 @@ pub fn TurboShake256Bo(comptime tag_length: usize) type {
 /// It takes blocks of up to `block_length` bytes, and can return up to `block_length` bytes after each of them.
 /// These bytes depend on the key and on all the blocks so far.
 ///
-/// A trailer is a few domain separation bits, lowest one first, with a 1 on top.
+/// A trailer is a few domain separation bits, least significant bit first, followed by a 1 bit.
 /// So 1 is the empty trailer, and 0 isn't a trailer.
 ///
 /// `padding` is the last byte of a block of the sponge function it is as secure as.
@@ -103,7 +103,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         pub fn init(key: []const u8) Self {
             assert(key.len <= key_length_max);
             var self: Self = .{};
-            self.duplex(&.{}, key, 1);
+            self.duplex(&.{}, key, 0b1);
             self.offset = block_length;
             return self;
         }
@@ -161,7 +161,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
             } else {
                 var block: [block_length]u8 = undefined;
                 self.st.extractBytes(block[0 .. self.offset + in.len]);
-                for (out, in, block[self.offset..][0..in.len]) |*o, i, k| o.* = i ^ k;
+                xorBytes(out, in, block[self.offset..][0..in.len]);
             }
             self.offset += in.len;
         }
@@ -195,6 +195,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
                 }
 
                 /// Make each clone absorb its own block.
+                /// Inlined so that the states stay in registers from one block to the next.
                 pub inline fn duplex(self: *Clones, comptime len: usize, blocks: [n]*const [len]u8, trailer: Trailer) void {
                     comptime assert(len <= block_length);
 
@@ -315,9 +316,13 @@ fn FlightDeckBatched(
             else => &.{ 2, 4, 8 },
         } else &.{};
         const max_batch_size = if (batch_sizes.len == 0) 1 else batch_sizes[batch_sizes.len - 1];
-        const blocks_per_chunk = (chunk_length - 1) / block_length + 1;
+        const blocks_per_chunk = @divCeil(chunk_length, block_length);
         const last_block_length = (chunk_length - 1) % block_length + 1;
         const no_output = math.maxInt(u64);
+
+        const no_trailer = 0b1;
+        const counter_trailer = 0b10;
+        const chaining_value_trailer = 0b100;
 
         /// Recommended key length, in bytes.
         pub const key_length = Duplex.key_length;
@@ -374,21 +379,21 @@ fn FlightDeckBatched(
                             while (true) : (done += block_length) {
                                 if (tail_length != 0 and done == tail_length) tail = clones.get(count);
                                 if (done == chunk_length - last_block_length) break;
-                                clones.duplex(block_length, blocksOf(n, block_length, chunks, count, tail_length, done), 1);
+                                clones.duplex(block_length, blocksOf(n, block_length, chunks, count, tail_length, done), no_trailer);
                             }
                             if (first) {
                                 // The first clone played the main duplex. The end of its chunk may share a block with chaining values.
                                 self.d = clones.get(0);
                                 root.update(chunks[done..chunk_length]);
                             }
-                            clones.duplex(last_block_length, blocksOf(n, last_block_length, chunks, count, tail_length, done), 4);
+                            clones.duplex(last_block_length, blocksOf(n, last_block_length, chunks, count, tail_length, done), chaining_value_trailer);
 
                             var cvs: [n * chaining_value_length]u8 = undefined;
                             clones.squeeze(chaining_value_length, &cvs);
                             root.update(cvs[@intFromBool(first) * chaining_value_length .. count * chaining_value_length]);
                             chunks = chunks[count * chunk_length ..];
                             if (tail_length != 0) {
-                                tail.duplex(cvs[0..chaining_value_length], chunks[tail_length..], 4);
+                                tail.duplex(cvs[0..chaining_value_length], chunks[tail_length..], chaining_value_trailer);
                                 root.update(cvs[0..chaining_value_length]);
                                 chunks = chunks[chunks.len..];
                             }
@@ -407,7 +412,7 @@ fn FlightDeckBatched(
                     chunks = chunks[chunk.len..];
                     var cv: [chaining_value_length]u8 = undefined;
                     var d = d0;
-                    absorb(&d, chunk, 4);
+                    absorb(&d, chunk, chaining_value_trailer);
                     d.squeeze(&cv);
                     root.update(&cv);
                 }
@@ -451,7 +456,7 @@ fn FlightDeckBatched(
             batches: while (i < in.len) {
                 const left = in.len - i;
                 const index = self.offset / block_length;
-                const needed = (left - 1) / block_length + 1;
+                const needed = @divCeil(left, block_length);
 
                 if (needed >= 2) inline for (batch_sizes) |n| {
                     if (needed <= n or n == max_batch_size) {
@@ -461,7 +466,7 @@ fn FlightDeckBatched(
                             block.* = counter;
                         }
                         var clones: Duplex.Parallel(n) = .init(&self.d);
-                        clones.duplex(block_length, blocks, 2);
+                        clones.duplex(block_length, blocks, counter_trailer);
 
                         const batch_length = n * block_length;
                         if (left >= batch_length) {
@@ -482,7 +487,7 @@ fn FlightDeckBatched(
 
                 mem.writeInt(u64, counters[0][0..8], index, .little);
                 var d = self.d.cloneCompact();
-                d.duplex(&.{}, &counters[0], 2);
+                d.duplex(&.{}, &counters[0], counter_trailer);
                 const n = @min(block_length, left);
                 if (n == block_length) {
                     d.xor(out[i..][0..n], in[i..][0..n]);
@@ -518,7 +523,7 @@ fn FlightDeckBatched(
         fn absorb(d: *Duplex, in: []const u8, last_trailer: Duplex.Trailer) void {
             var left = in;
             while (left.len > block_length) : (left = left[block_length..]) {
-                d.duplex(&.{}, left[0..block_length], 1);
+                d.duplex(&.{}, left[0..block_length], no_trailer);
             }
             d.duplex(&.{}, left, last_trailer);
         }
@@ -540,10 +545,10 @@ fn FlightDeckBatched(
                     self.len += n;
                     left = left[n..];
                     if (left.len == 0) return;
-                    self.d.duplex(&.{}, &self.buf, 1);
+                    self.d.duplex(&.{}, &self.buf, no_trailer);
                 }
                 while (left.len > block_length) : (left = left[block_length..]) {
-                    self.d.duplex(&.{}, left[0..block_length], 1);
+                    self.d.duplex(&.{}, left[0..block_length], no_trailer);
                 }
                 @memcpy(self.buf[0..left.len], left);
                 self.len = left.len;
@@ -562,20 +567,25 @@ fn FlightDeckBatched(
 /// There is no nonce, so the same message at the same point of a session gets the same ciphertext.
 /// If that's a problem, put a nonce or a counter in the associated data.
 ///
-/// `tag_length` is in bytes.
-/// Twice the security level, 32 bytes for 128 bits, also commits to the key, the associated data and the message.
-pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
-    comptime assert(tag_length_ > 0);
+/// `tag_len` is in bytes. A forgery succeeds with probability 2^-(8 * tag_len).
+/// A tag twice as long as the security level, 32 bytes for 128 bits, also commits to the key, the associated data and the message.
+pub fn DeckBo(comptime Deck: type, comptime tag_len: usize) type {
+    comptime assert(tag_len > 0);
 
     return struct {
         const Self = @This();
 
         /// Length of the authentication tag, in bytes.
-        pub const tag_length = tag_length_;
+        pub const tag_length = tag_len;
         /// Recommended key length, in bytes.
         pub const key_length = Deck.key_length;
         /// Maximum key length, in bytes.
         pub const key_length_max = Deck.key_length_max;
+
+        const ad_only_trailer = 0b100;
+        const ad_trailer = 0b101;
+        const tag_trailer = 0b1101;
+        const message_trailer = 0b1110;
 
         deck: Deck,
 
@@ -593,13 +603,13 @@ pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
             assert(c.len == m.len);
 
             if (m.len == 0) {
-                self.deck.duplex(tag, ad, 4);
+                self.deck.duplex(tag, ad, ad_only_trailer);
                 return;
             }
-            if (ad.len != 0) self.deck.duplex(&.{}, ad, 5);
+            if (ad.len != 0) self.deck.duplex(&.{}, ad, ad_trailer);
             var keystream = self.deck.cloneCompact();
-            self.deck.duplex(tag, m, 14);
-            keystream.duplex(&.{}, tag, 13);
+            self.deck.duplex(tag, m, message_trailer);
+            keystream.duplex(&.{}, tag, tag_trailer);
             keystream.xor(c, m);
         }
 
@@ -616,13 +626,13 @@ pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
             var deck = self.deck.cloneCompact();
             var computed_tag: [tag_length]u8 = undefined;
             if (c.len == 0) {
-                deck.duplex(&computed_tag, ad, 4);
+                deck.duplex(&computed_tag, ad, ad_only_trailer);
             } else {
-                if (ad.len != 0) deck.duplex(&.{}, ad, 5);
+                if (ad.len != 0) deck.duplex(&.{}, ad, ad_trailer);
                 var keystream = deck.cloneCompact();
-                keystream.duplex(&.{}, &tag, 13);
+                keystream.duplex(&.{}, &tag, tag_trailer);
                 keystream.xor(m, c);
-                deck.duplex(&computed_tag, m, 14);
+                deck.duplex(&computed_tag, m, message_trailer);
             }
             if (!crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
                 crypto.secureZero(u8, &computed_tag);
@@ -733,10 +743,6 @@ inline fn permute(comptime n: comptime_int, comptime rounds: u5, st: *[25]@Vecto
     }
 }
 
-test {
-    _ = @import("flightdeck_test.zig");
-}
-
 // FlightDeck as written in Algorithm 3 of the paper.
 fn ReferenceFlightDeck(comptime Duplex: type, comptime alpha: usize, comptime c: usize) type {
     const rho = Duplex.block_length;
@@ -845,4 +851,8 @@ test "FlightDeck against the reference algorithm" {
             }
         }
     }
+}
+
+test {
+    _ = @import("flightdeck_test.zig");
 }
