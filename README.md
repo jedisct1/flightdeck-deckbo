@@ -9,15 +9,18 @@ It's plain Zig: no dependencies besides the standard library, no assembly.
 It uses SIMD wherever your target has it, WebAssembly included.
 
 FlightDeck comes from "Parallelizable modes for duplex-based authenticated encryption" by Joan Daemen, Silvia Mella and Gilles Van Assche.
+
 The overwrite duplex and Deck-BO come from "Shaking up authenticated encryption" by Joan Daemen, Seth Hoffert, Silvia Mella, Gilles Van Assche and Ronny Van Keer.
 
 ## What's in there
 
+```text
 | Layer             | Types                                                                                              |
 |-------------------+----------------------------------------------------------------------------------------------------|
 | Duplex cipher     | `Shake128Duplex`, `Shake256Duplex`, `TurboShake128Duplex`, `TurboShake256Duplex`                   |
 | Deck cipher       | `Shake128FlightDeck`, `Shake256FlightDeck`, `TurboShake128FlightDeck`, `TurboShake256FlightDeck`   |
 | Authenticated enc | `Shake128Bo(tag_length)`, `Shake256Bo(...)`, `TurboShake128Bo(...)`, `TurboShake256Bo(...)`        |
+```
 
 Not sure which layer you need? Here's what each one does:
 
@@ -45,7 +48,7 @@ The 128 and 256 in the names are the security levels, in bits.
 
 Add the package to your `build.zig.zon`:
 
-```
+```sh
 zig fetch --save <URL of this repository>
 ```
 
@@ -106,19 +109,21 @@ try receiver.decrypt(decrypted, ciphertext, tag, associated_data);
 
 Every message is authenticated along with all the messages that came before it in the session.
 
-There's no nonce.
-So if you encrypt the same message twice, at the same point of two sessions with the same key, you get the same ciphertext.
+There's no nonce. So if you encrypt the same message twice, at the same point of two sessions with the same key, you get the same ciphertext.
+
 Besides the length of the message, that's all it reveals, but if it matters to you, put a nonce or a counter in the associated data.
 
 The tag length is a parameter, in bytes.
+
 A tag of twice the security level, so 32 bytes for the 128-bit instances, also commits to the key, the associated data and the plaintext at that security level.
 
 Keys are normally `key_length` random bytes: 16 for the 128-bit instances and 32 for the 256-bit ones.
+
 That said, any byte string of at most `key_length_max` bytes is accepted, which is 160 and 128 bytes respectively.
 
 ## Running the tests
 
-```
+```sh
 zig build test     # run the tests
 zig build bench    # measure the throughput
 ```
