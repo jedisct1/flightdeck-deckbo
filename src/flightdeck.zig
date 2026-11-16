@@ -27,9 +27,9 @@ const KeccakF = crypto.core.keccak.KeccakF;
 pub const Shake128FlightDeck = FlightDeck(Shake128Duplex, 5120, 32);
 /// SHAKE256-FlightDeck, a deck cipher with 256 bits of security.
 pub const Shake256FlightDeck = FlightDeck(Shake256Duplex, 8192, 64);
-/// TurboSHAKE128-FlightDeck, about twice as fast as `Shake128FlightDeck`.
+/// TurboSHAKE128-FlightDeck, a deck cipher with 128 bits of security. About twice as fast as the SHAKE128 one.
 pub const TurboShake128FlightDeck = FlightDeck(TurboShake128Duplex, 5120, 32);
-/// TurboSHAKE256-FlightDeck, about twice as fast as `Shake256FlightDeck`.
+/// TurboSHAKE256-FlightDeck, a deck cipher with 256 bits of security. About twice as fast as the SHAKE256 one.
 pub const TurboShake256FlightDeck = FlightDeck(TurboShake256Duplex, 8192, 64);
 
 /// The overwrite duplex that is as secure as SHAKE128.
@@ -73,7 +73,7 @@ pub fn TurboShake256Bo(comptime tag_len: usize) type {
 /// A trailer is a few domain separation bits, least significant bit first, followed by a 1 bit.
 /// So 1 is the empty trailer, and 0 isn't a trailer.
 ///
-/// `padding` is the last byte of a block of the sponge function it is as secure as.
+/// `padding` is the last byte of a block of the sponge function whose security it matches.
 pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, comptime padding: u8) type {
     comptime assert(security_level > 0 and security_level <= 256 and security_level % 32 == 0);
     comptime assert(rounds <= KeccakF(1600).max_rounds);
