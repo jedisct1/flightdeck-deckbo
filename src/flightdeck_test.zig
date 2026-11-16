@@ -92,7 +92,7 @@ test "OverwriteDuplex against SHAKE and TurboSHAKE" {
 test "FlightDeck test vectors" {
     const key = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
 
-    // Generated with XKCP.
+    // Generated with XKCP, commit d20c8fc.
     // The last one has chunks that don't end on a block boundary.
     inline for (.{
         .{ Shake128FlightDeck, 5120, [_]*const [64:0]u8{
@@ -148,8 +148,8 @@ test "FlightDeck test vectors" {
     }
 }
 
-// A duplex cipher that asks for up to `parallelism` clones at once, whatever the target.
-fn WithParallelism(comptime Duplex: type, comptime parallelism_: comptime_int) type {
+// A duplex cipher that asks for up to `parallel_blocks` clones at once, whatever the target.
+fn WithParallelism(comptime Duplex: type, comptime parallel_blocks: comptime_int) type {
     return struct {
         const Self = @This();
 
@@ -158,7 +158,7 @@ fn WithParallelism(comptime Duplex: type, comptime parallelism_: comptime_int) t
         pub const key_length_min = Duplex.key_length_min;
         pub const key_length_max = Duplex.key_length_max;
         pub const Trailer = Duplex.Trailer;
-        pub const parallelism = parallelism_;
+        pub const optimal_parallel_blocks = parallel_blocks;
 
         d: Duplex,
 
@@ -330,7 +330,7 @@ test "DeckBo test vectors" {
         long_ciphertext: *const [64:0]u8,
         long_tag: *const [64:0]u8,
     };
-    // Generated with XKCP.
+    // Generated with XKCP, commit d20c8fc.
     const vectors = [_]Vectors{
         .{
             .session = .{

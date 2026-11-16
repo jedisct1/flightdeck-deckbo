@@ -96,7 +96,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         /// A trailer of up to 5 bits, from 1 to 63.
         pub const Trailer = u6;
         /// How many clones `Parallel()` should process at once on this target.
-        pub const parallelism = simd.suggestVectorLength(u64) orelse 1;
+        pub const optimal_parallel_blocks = simd.suggestVectorLength(u64) orelse 1;
 
         st: Permutation = .{},
         offset: usize = block_length,
@@ -290,7 +290,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
 /// The FlightDeck deck cipher: like a duplex cipher (see `OverwriteDuplex`), with inputs and outputs of any length.
 ///
-/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel()` and `parallelism` are optional.
+/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel()` and `optimal_parallel_blocks` are optional.
 /// Long inputs are cut into chunks of `chunk_length` bytes, each summed up in `chaining_value_length` bytes.
 pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime chaining_value_length: usize) type {
     const block_length = Duplex.block_length;
@@ -303,7 +303,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
     return struct {
         const Self = @This();
 
-        const batch_sizes: []const comptime_int = if (@hasDecl(Duplex, "Parallel")) switch (Duplex.parallelism) {
+        const batch_sizes: []const comptime_int = if (@hasDecl(Duplex, "Parallel")) switch (Duplex.optimal_parallel_blocks) {
             1 => &.{},
             2, 3 => &.{2},
             4...7 => &.{ 2, 4 },
@@ -473,6 +473,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
                         } else {
                             var batch: [batch_length]u8 = undefined;
                             clones.squeeze(block_length, &batch);
+                            // Whole vectors, since a loop over the slices is slow when `out` is `in`.
                             const Block = @Vector(block_length, u8);
                             for (0..left / block_length) |j| {
                                 const x: Block = in[i..][0..block_length].*;
@@ -640,7 +641,6 @@ pub fn DeckBo(comptime Deck: type, comptime tag_len: usize) type {
                 deck.duplex(&computed_tag, m, message_trailer);
             }
             if (!crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
-                crypto.secureZero(u8, &computed_tag);
                 crypto.secureZero(u8, m);
                 return error.AuthenticationFailed;
             }
