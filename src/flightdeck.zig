@@ -11,19 +11,14 @@
 //! Overwrite duplex and Deck-BO: https://eprint.iacr.org/2024/1618
 
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const crypto = std.crypto;
 const math = std.math;
 const mem = std.mem;
 const simd = std.simd;
 
-const native_endian = builtin.cpu.arch.endian();
-
 const AuthenticationError = crypto.errors.AuthenticationError;
 const KeccakF = crypto.core.keccak.KeccakF;
-
-const max_parallelism = simd.suggestVectorLength(u64) orelse 1;
 
 /// SHAKE128-FlightDeck, a deck cipher with 128 bits of security.
 pub const Shake128FlightDeck = FlightDeck(Shake128Duplex, 5120, 32);
@@ -95,6 +90,8 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         pub const key_length_max = block_length;
         /// A trailer of up to 5 bits, from 1 to 63.
         pub const Trailer = u6;
+        /// How many clones `Parallel()` should process at once on this target.
+        pub const parallelism = simd.suggestVectorLength(u64) orelse 1;
 
         st: Permutation = .{},
         offset: usize = block_length,
@@ -159,9 +156,12 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
             if (self.offset == 0) {
                 self.st.xorBytes(out, in);
             } else {
-                var block: [block_length]u8 = undefined;
-                self.st.extractBytes(block[0 .. self.offset + in.len]);
-                xorBytes(out, in, block[self.offset..][0..in.len]);
+                // xorBytes() starts at the first byte of the state, so line the input up with the output.
+                const end = self.offset + in.len;
+                var block: [block_length]u8 = @splat(0);
+                @memcpy(block[self.offset..end], in);
+                self.st.xorBytes(block[0..end], block[0..end]);
+                @memcpy(out, block[self.offset..end]);
             }
             self.offset += in.len;
         }
@@ -184,9 +184,9 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
                     return self;
                 }
 
-                /// A compact clone of the clone `i`.
+                /// The clone `i`, as a duplex cipher of its own.
                 pub fn get(self: *const Clones, i: usize) Self {
-                    var d: Self = .{};
+                    var d: Self = .{ .offset = 0 };
                     inline for (&d.st.st, self.st) |*lane, lanes| {
                         const clones: [n]u64 = lanes;
                         lane.* = clones[i];
@@ -285,22 +285,11 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
 /// The FlightDeck deck cipher: like a duplex cipher (see `OverwriteDuplex`), with inputs and outputs of any length.
 ///
-/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel` is optional.
+/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel()` and `parallelism` are optional.
 /// Long inputs are cut into chunks of `chunk_length` bytes, each summed up in `chaining_value_length` bytes.
 pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime chaining_value_length: usize) type {
-    return FlightDeckBatched(Duplex, chunk_length, chaining_value_length, max_parallelism);
-}
-
-/// `parallelism` is how many Keccak states are processed at once. It doesn't change the output.
-fn FlightDeckBatched(
-    comptime Duplex: type,
-    comptime chunk_length: usize,
-    comptime chaining_value_length: usize,
-    comptime parallelism: comptime_int,
-) type {
     const block_length = Duplex.block_length;
 
-    comptime assert(parallelism >= 1);
     comptime assert(chunk_length > 0);
     comptime assert(chaining_value_length > 0 and chaining_value_length <= block_length);
     // The 64-bit counter of output blocks has to fit in a block.
@@ -309,7 +298,7 @@ fn FlightDeckBatched(
     return struct {
         const Self = @This();
 
-        const batch_sizes: []const comptime_int = if (@hasDecl(Duplex, "Parallel")) switch (parallelism) {
+        const batch_sizes: []const comptime_int = if (@hasDecl(Duplex, "Parallel")) switch (Duplex.parallelism) {
             1 => &.{},
             2, 3 => &.{2},
             4...7 => &.{ 2, 4 },
@@ -318,7 +307,6 @@ fn FlightDeckBatched(
         const max_batch_size = if (batch_sizes.len == 0) 1 else batch_sizes[batch_sizes.len - 1];
         const blocks_per_chunk = @divCeil(chunk_length, block_length);
         const last_block_length = (chunk_length - 1) % block_length + 1;
-        const no_output = math.maxInt(u64);
 
         const no_trailer = 0b1;
         const counter_trailer = 0b10;
@@ -332,9 +320,10 @@ fn FlightDeckBatched(
         pub const Trailer = @Int(.unsigned, @bitSizeOf(Duplex.Trailer) - 1);
 
         d: Duplex,
-        /// The current output block, after the first one.
-        block: [block_length]u8 = undefined,
-        offset: u64 = no_output,
+        /// A clone of `d` that gives the current output block, after the first one.
+        d_squeeze: Duplex = undefined,
+        /// How many bytes of output were squeezed, or null before the first call to `duplex()`.
+        offset: ?u64 = null,
 
         /// Set the key. Nothing can be squeezed before the first call to `duplex()`.
         pub fn init(key: []const u8) Self {
@@ -388,13 +377,13 @@ fn FlightDeckBatched(
                             }
                             clones.duplex(last_block_length, blocksOf(n, last_block_length, chunks, count, tail_length, done), chaining_value_trailer);
 
-                            var cvs: [n * chaining_value_length]u8 = undefined;
-                            clones.squeeze(chaining_value_length, &cvs);
-                            root.update(cvs[@intFromBool(first) * chaining_value_length .. count * chaining_value_length]);
+                            var cvs: [n][chaining_value_length]u8 = undefined;
+                            clones.squeeze(chaining_value_length, mem.asBytes(&cvs));
+                            root.update(mem.sliceAsBytes(cvs[@intFromBool(first)..count]));
                             chunks = chunks[count * chunk_length ..];
                             if (tail_length != 0) {
-                                tail.duplex(cvs[0..chaining_value_length], chunks[tail_length..], chaining_value_trailer);
-                                root.update(cvs[0..chaining_value_length]);
+                                tail.duplex(&cvs[0], chunks[tail_length..], chaining_value_trailer);
+                                root.update(&cvs[0]);
                                 chunks = chunks[chunks.len..];
                             }
                             first = false;
@@ -432,20 +421,21 @@ fn FlightDeckBatched(
         /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
         pub fn xor(self: *Self, out: []u8, in: []const u8) void {
             assert(out.len == in.len);
-            assert(self.offset != no_output);
-            assert(in.len < no_output - self.offset);
+            var offset = self.offset.?;
+            defer self.offset = offset;
+            assert(in.len <= math.maxInt(u64) - offset);
 
             var i: usize = 0;
-            if (self.offset < block_length) {
-                i = @min(block_length - self.offset, in.len);
+            if (offset < block_length) {
+                i = @min(block_length - offset, in.len);
                 self.d.xor(out[0..i], in[0..i]);
-                self.offset += i;
+                offset += i;
             }
-            const used: usize = @intCast(self.offset % block_length);
+            const used: usize = @intCast(offset % block_length);
             if (used != 0 and i < in.len) {
                 const n = @min(block_length - used, in.len - i);
-                xorBytes(out[i..][0..n], in[i..][0..n], self.block[used..][0..n]);
-                self.offset += n;
+                self.d_squeeze.xor(out[i..][0..n], in[i..][0..n]);
+                offset += n;
                 i += n;
             }
 
@@ -455,7 +445,7 @@ fn FlightDeckBatched(
             var counters: [max_batch_size][block_length]u8 = @splat(@splat(0));
             batches: while (i < in.len) {
                 const left = in.len - i;
-                const index = self.offset / block_length;
+                const index = offset / block_length;
                 const needed = @divCeil(left, block_length);
 
                 if (needed >= 2) inline for (batch_sizes) |n| {
@@ -471,31 +461,37 @@ fn FlightDeckBatched(
                         const batch_length = n * block_length;
                         if (left >= batch_length) {
                             clones.xor(block_length, out[i..][0..batch_length], in[i..][0..batch_length]);
-                            self.offset += batch_length;
+                            offset += batch_length;
                             i += batch_length;
                         } else {
                             var batch: [batch_length]u8 = undefined;
                             clones.squeeze(block_length, &batch);
-                            xorBytes(out[i..], in[i..], batch[0..left]);
-                            self.block = batch[(needed - 1) * block_length ..][0..block_length].*;
-                            self.offset += left;
-                            i += left;
+                            const Block = @Vector(block_length, u8);
+                            for (0..left / block_length) |j| {
+                                const x: Block = in[i..][0..block_length].*;
+                                const k: Block = batch[j * block_length ..][0..block_length].*;
+                                out[i..][0..block_length].* = x ^ k;
+                                offset += block_length;
+                                i += block_length;
+                            }
+                            // The clone of a last, shorter block is kept for the next call.
+                            if (i < in.len) {
+                                self.d_squeeze = clones.get(needed - 1);
+                                self.d_squeeze.xor(out[i..], in[i..]);
+                                offset += in.len - i;
+                                i = in.len;
+                            }
                         }
                         continue :batches;
                     }
                 };
 
                 mem.writeInt(u64, counters[0][0..8], index, .little);
-                var d = self.d.cloneCompact();
-                d.duplex(&.{}, &counters[0], counter_trailer);
+                self.d_squeeze = self.d.cloneCompact();
+                self.d_squeeze.duplex(&.{}, &counters[0], counter_trailer);
                 const n = @min(block_length, left);
-                if (n == block_length) {
-                    d.xor(out[i..][0..n], in[i..][0..n]);
-                } else {
-                    d.squeeze(&self.block);
-                    xorBytes(out[i..], in[i..], self.block[0..n]);
-                }
-                self.offset += n;
+                self.d_squeeze.xor(out[i..][0..n], in[i..][0..n]);
+                offset += n;
                 i += n;
             }
         }
@@ -652,18 +648,6 @@ fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trail
     return trailer + (end << bit);
 }
 
-fn xorBytes(out: []u8, in: []const u8, key: []const u8) void {
-    assert(out.len == in.len and out.len == key.len);
-
-    // A plain loop over the three slices stays slow when `out` is `in`.
-    var i: usize = 0;
-    while (i + 8 <= out.len) : (i += 8) {
-        const x = mem.readInt(u64, in[i..][0..8], native_endian) ^ mem.readInt(u64, key[i..][0..8], native_endian);
-        mem.writeInt(u64, out[i..][0..8], x, native_endian);
-    }
-    while (i < out.len) : (i += 1) out[i] = in[i] ^ key[i];
-}
-
 fn transpose(comptime n: comptime_int, rows: *[n]@Vector(n, u64)) void {
     comptime assert(n >= 2 and math.isPowerOfTwo(n));
     const half = n / 2;
@@ -740,116 +724,6 @@ inline fn permute(comptime n: comptime_int, comptime rounds: u5, st: *[25]@Vecto
         }
 
         st[0] ^= @splat(round_constant);
-    }
-}
-
-// FlightDeck as written in Algorithm 3 of the paper.
-fn ReferenceFlightDeck(comptime Duplex: type, comptime alpha: usize, comptime c: usize) type {
-    const rho = Duplex.block_length;
-
-    return struct {
-        const Self = @This();
-
-        d: Duplex,
-        d_squeeze: Duplex = undefined,
-        o: usize = undefined,
-
-        fn duplexing(self: *Self, allocator: mem.Allocator, z: []u8, x: []const u8, e: u5) !void {
-            var r: std.ArrayList(u8) = .empty;
-            defer r.deinit(allocator);
-
-            try r.appendSlice(allocator, x[0..@min(alpha, x.len)]);
-            var i: usize = alpha;
-            while (i < x.len) : (i += alpha) {
-                var y = x[i..@min(i + alpha, x.len)];
-                var d_prime = self.d.cloneCompact();
-                while (y.len > rho) : (y = y[rho..]) d_prime.duplex(&.{}, y[0..rho], 1);
-                var cv: [c]u8 = undefined;
-                d_prime.duplex(&cv, y, 4);
-                try r.appendSlice(allocator, &cv);
-            }
-            var left = r.items;
-            while (left.len > rho) : (left = left[rho..]) self.d.duplex(&.{}, left[0..rho], 1);
-            // E||1
-            const two: u6 = 2;
-            self.d.duplex(&.{}, left, e + (two << math.log2_int(u5, e)));
-            self.o = 0;
-            self.squeezing(z);
-        }
-
-        fn squeezing(self: *Self, z: []u8) void {
-            var done: usize = 0;
-            if (self.o <= rho) {
-                done = @min(rho - self.o, z.len);
-                self.d.squeeze(z[0..done]);
-                self.o += done;
-            }
-            while (done < z.len) {
-                if (self.o % rho == 0) {
-                    var counter: [rho]u8 = @splat(0);
-                    mem.writeInt(u64, counter[0..8], self.o / rho, .little);
-                    self.d_squeeze = self.d.cloneCompact();
-                    self.d_squeeze.duplex(&.{}, &counter, 2);
-                }
-                const n = @min(rho - self.o % rho, z.len - done);
-                self.d_squeeze.squeeze(z[done..][0..n]);
-                self.o += n;
-                done += n;
-            }
-        }
-    };
-}
-
-test "FlightDeck against the reference algorithm" {
-    const allocator = std.testing.allocator;
-
-    inline for (.{
-        .{ TurboShake128Duplex, 5120, 32 },
-        // Chunks that don't end on a block boundary, chaining values that don't end on a lane boundary.
-        .{ TurboShake128Duplex, 327, 13 },
-        // One block per chunk, chaining values as long as a block.
-        .{ TurboShake256Duplex, 128, 128 },
-    }) |parameters| {
-        const Duplex, const alpha, const c = parameters;
-        const rho = Duplex.block_length;
-
-        var reference: ReferenceFlightDeck(Duplex, alpha, c) = .{ .d = .init("key") };
-        // Every batch size, including the ones the target wouldn't pick.
-        var decks: struct {
-            FlightDeckBatched(Duplex, alpha, c, 1),
-            FlightDeckBatched(Duplex, alpha, c, 2),
-            FlightDeckBatched(Duplex, alpha, c, 4),
-            FlightDeckBatched(Duplex, alpha, c, 8),
-        } = .{ .init("key"), .init("key"), .init("key"), .init("key") };
-
-        const in = try allocator.alloc(u8, 18 * alpha + rho + 1);
-        defer allocator.free(in);
-        for (in, 0..) |*b, i| b.* = @truncate(5 * i + 1);
-        var expected: [20 * rho]u8 = undefined;
-        var out: [expected.len]u8 = undefined;
-
-        var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
-        const random = prng.random();
-
-        // Lengths around every multiple of half a chunk, where the way chunks are batched changes.
-        for (0..37) |half_chunks| {
-            for ([_]usize{ 0, 1, 2, rho + 1, rho + 2 }) |extra| {
-                const x = in[0..half_chunks * alpha / 2 + extra -| 1];
-                const trailer = random.intRangeAtMost(u5, 1, 31);
-                const z = out[0..random.uintAtMost(usize, out.len)];
-                const second = random.uintAtMost(usize, z.len);
-                const first = random.uintAtMost(usize, second);
-
-                try reference.duplexing(allocator, expected[0..z.len], x, trailer);
-                // The same output, in three pieces.
-                inline for (&decks) |*deck| {
-                    deck.duplex(z[0..first], x, trailer);
-                    deck.squeeze(z[first..second]);
-                    deck.squeeze(z[second..]);
-                    try std.testing.expectEqualSlices(u8, expected[0..z.len], z);
-                }
-            }
-        }
     }
 }
 

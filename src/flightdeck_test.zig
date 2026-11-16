@@ -1,5 +1,6 @@
 const std = @import("std");
 const crypto = std.crypto;
+const math = std.math;
 const mem = std.mem;
 const testing = std.testing;
 
@@ -143,6 +144,179 @@ test "FlightDeck test vectors" {
             var end: [32]u8 = undefined;
             _ = try std.fmt.hexToBytes(&end, hex);
             try testing.expectEqualSlices(u8, &end, out[out_len - 32 .. out_len]);
+        }
+    }
+}
+
+// A duplex cipher that asks for up to `parallelism` clones at once, whatever the target.
+fn WithParallelism(comptime Duplex: type, comptime parallelism_: comptime_int) type {
+    return struct {
+        const Self = @This();
+
+        pub const block_length = Duplex.block_length;
+        pub const key_length = Duplex.key_length;
+        pub const key_length_max = Duplex.key_length_max;
+        pub const Trailer = Duplex.Trailer;
+        pub const parallelism = parallelism_;
+
+        d: Duplex,
+
+        pub fn init(key: []const u8) Self {
+            return .{ .d = .init(key) };
+        }
+
+        pub fn cloneCompact(self: *const Self) Self {
+            return .{ .d = self.d.cloneCompact() };
+        }
+
+        pub fn duplex(self: *Self, out: []u8, in: []const u8, trailer: Trailer) void {
+            self.d.duplex(out, in, trailer);
+        }
+
+        pub fn squeeze(self: *Self, out: []u8) void {
+            self.d.squeeze(out);
+        }
+
+        pub fn xor(self: *Self, out: []u8, in: []const u8) void {
+            self.d.xor(out, in);
+        }
+
+        pub fn Parallel(comptime n: comptime_int) type {
+            return struct {
+                const Clones = @This();
+
+                clones: Duplex.Parallel(n),
+
+                pub fn init(d: *const Self) Clones {
+                    return .{ .clones = .init(&d.d) };
+                }
+
+                pub fn get(self: *const Clones, i: usize) Self {
+                    return .{ .d = self.clones.get(i) };
+                }
+
+                pub inline fn duplex(self: *Clones, comptime len: usize, blocks: [n]*const [len]u8, trailer: Trailer) void {
+                    self.clones.duplex(len, blocks, trailer);
+                }
+
+                pub fn squeeze(self: *const Clones, comptime len: usize, out: *[n * len]u8) void {
+                    self.clones.squeeze(len, out);
+                }
+
+                pub fn xor(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
+                    self.clones.xor(len, out, in);
+                }
+            };
+        }
+    };
+}
+
+// FlightDeck as written in Algorithm 3 of the paper.
+fn ReferenceFlightDeck(comptime Duplex: type, comptime alpha: usize, comptime c: usize) type {
+    const rho = Duplex.block_length;
+
+    return struct {
+        const Self = @This();
+
+        d: Duplex,
+        d_squeeze: Duplex = undefined,
+        o: usize = undefined,
+
+        fn duplexing(self: *Self, allocator: mem.Allocator, z: []u8, x: []const u8, e: u5) !void {
+            var r: std.ArrayList(u8) = .empty;
+            defer r.deinit(allocator);
+
+            try r.appendSlice(allocator, x[0..@min(alpha, x.len)]);
+            var i: usize = alpha;
+            while (i < x.len) : (i += alpha) {
+                var y = x[i..@min(i + alpha, x.len)];
+                var d_prime = self.d.cloneCompact();
+                while (y.len > rho) : (y = y[rho..]) d_prime.duplex(&.{}, y[0..rho], 1);
+                var cv: [c]u8 = undefined;
+                d_prime.duplex(&cv, y, 4);
+                try r.appendSlice(allocator, &cv);
+            }
+            var left = r.items;
+            while (left.len > rho) : (left = left[rho..]) self.d.duplex(&.{}, left[0..rho], 1);
+            // E||1
+            const two: u6 = 2;
+            self.d.duplex(&.{}, left, e + (two << math.log2_int(u5, e)));
+            self.o = 0;
+            self.squeezing(z);
+        }
+
+        fn squeezing(self: *Self, z: []u8) void {
+            var done: usize = 0;
+            if (self.o <= rho) {
+                done = @min(rho - self.o, z.len);
+                self.d.squeeze(z[0..done]);
+                self.o += done;
+            }
+            while (done < z.len) {
+                if (self.o % rho == 0) {
+                    var counter: [rho]u8 = @splat(0);
+                    mem.writeInt(u64, counter[0..8], self.o / rho, .little);
+                    self.d_squeeze = self.d.cloneCompact();
+                    self.d_squeeze.duplex(&.{}, &counter, 2);
+                }
+                const n = @min(rho - self.o % rho, z.len - done);
+                self.d_squeeze.squeeze(z[done..][0..n]);
+                self.o += n;
+                done += n;
+            }
+        }
+    };
+}
+
+test "FlightDeck against the reference algorithm" {
+    const allocator = testing.allocator;
+
+    inline for (.{
+        .{ TurboShake128Duplex, 5120, 32 },
+        // Chunks that don't end on a block boundary, chaining values that don't end on a lane boundary.
+        .{ TurboShake128Duplex, 327, 13 },
+        // One block per chunk, chaining values as long as a block.
+        .{ TurboShake256Duplex, 128, 128 },
+    }) |parameters| {
+        const Duplex, const alpha, const c = parameters;
+        const rho = Duplex.block_length;
+
+        var reference: ReferenceFlightDeck(Duplex, alpha, c) = .{ .d = .init("key") };
+        // Every batch size, including the ones the target wouldn't pick.
+        var decks: struct {
+            FlightDeck(WithParallelism(Duplex, 1), alpha, c),
+            FlightDeck(WithParallelism(Duplex, 2), alpha, c),
+            FlightDeck(WithParallelism(Duplex, 4), alpha, c),
+            FlightDeck(WithParallelism(Duplex, 8), alpha, c),
+        } = .{ .init("key"), .init("key"), .init("key"), .init("key") };
+
+        const in = try allocator.alloc(u8, 18 * alpha + rho + 1);
+        defer allocator.free(in);
+        for (in, 0..) |*b, i| b.* = @truncate(5 * i + 1);
+        var expected: [20 * rho]u8 = undefined;
+        var out: [expected.len]u8 = undefined;
+
+        var prng: std.Random.DefaultPrng = .init(testing.random_seed);
+        const random = prng.random();
+
+        // Lengths around every multiple of half a chunk, where the way chunks are batched changes.
+        for (0..37) |half_chunks| {
+            for ([_]usize{ 0, 1, 2, rho + 1, rho + 2 }) |extra| {
+                const x = in[0..half_chunks * alpha / 2 + extra -| 1];
+                const trailer = random.intRangeAtMost(u5, 1, 31);
+                const z = out[0..random.uintAtMost(usize, out.len)];
+                const second = random.uintAtMost(usize, z.len);
+                const first = random.uintAtMost(usize, second);
+
+                try reference.duplexing(allocator, expected[0..z.len], x, trailer);
+                // The same output, in three pieces.
+                inline for (&decks) |*deck| {
+                    deck.duplex(z[0..first], x, trailer);
+                    deck.squeeze(z[first..second]);
+                    deck.squeeze(z[second..]);
+                    try testing.expectEqualSlices(u8, expected[0..z.len], z);
+                }
+            }
         }
     }
 }
