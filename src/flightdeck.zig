@@ -1,11 +1,14 @@
 //! FlightDeck, a deck cipher that processes long inputs and long outputs in parallel.
 //!
-//! A deck cipher has a key, takes strings of any length, and can return any number of bytes after each of them.
-//! These bytes depend on the key and on all the strings so far.
+//! A deck cipher has a key, takes slices of bytes of any length, and can return any number of bytes after each of them.
+//! These bytes depend on the key and on all the inputs so far.
 //!
-//! - `OverwriteDuplex`: a duplex cipher, as secure as (Turbo)SHAKE.
-//! - `FlightDeck`: a deck cipher on top of a duplex cipher.
-//! - `DeckBo`: authenticated encryption on top of a deck cipher.
+//! - `OverwriteDuplex`: a duplex cipher, as secure as (Turbo)SHAKE. `FlightDeck` is built on it.
+//! - `FlightDeck`: a deck cipher on top of a duplex cipher. Use `TurboShake128FlightDeck` and its siblings.
+//! - `DeckBo`: authenticated encryption on top of a deck cipher. Use `TurboShake128Bo()` and its siblings.
+//!
+//! Keys are normally `key_length` random bytes, and can be anything up to `key_length_max` bytes.
+//! `DeckBo` works on sessions and has no nonce: the same message at the same point of a session gets the same ciphertext.
 //!
 //! FlightDeck: https://eprint.iacr.org/2026/2801
 //! Overwrite duplex and Deck-BO: https://eprint.iacr.org/2024/1618
@@ -86,6 +89,8 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         pub const block_length: comptime_int = Permutation.block_bytes - 8 - security_level / 4;
         /// Recommended key length, in bytes.
         pub const key_length = security_level / 8;
+        /// Minimum key length, in bytes.
+        pub const key_length_min = 0;
         /// Maximum key length, in bytes.
         pub const key_length_max = block_length;
         /// A trailer of up to 5 bits, from 1 to 63.
@@ -314,6 +319,8 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
 
         /// Recommended key length, in bytes.
         pub const key_length = Duplex.key_length;
+        /// Minimum key length, in bytes.
+        pub const key_length_min = Duplex.key_length_min;
         /// Maximum key length, in bytes.
         pub const key_length_max = Duplex.key_length_max;
         /// A trailer of up to 4 bits, from 1 to 31.
@@ -335,7 +342,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
             return .{ .d = self.d.cloneCompact() };
         }
 
-        /// Absorb a string and its trailer, then squeeze `out`.
+        /// Absorb a slice of bytes of any length and its trailer, then squeeze `out`.
         pub fn duplex(self: *Self, out: []u8, in: []const u8, trailer: Trailer) void {
             const last_trailer = appendBit(trailer, 1);
 
@@ -515,7 +522,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
             return blocks;
         }
 
-        /// Absorb a string block by block. The last block gets `last_trailer`.
+        /// Absorb a slice of bytes block by block. The last block gets `last_trailer`.
         fn absorb(d: *Duplex, in: []const u8, last_trailer: Duplex.Trailer) void {
             var left = in;
             while (left.len > block_length) : (left = left[block_length..]) {
@@ -524,7 +531,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
             d.duplex(&.{}, left, last_trailer);
         }
 
-        /// Like `absorb()`, for a string that comes in pieces.
+        /// Like `absorb()`, for an input that comes in pieces.
         const Root = struct {
             d: *Duplex,
             buf: [block_length]u8 = undefined,
@@ -575,6 +582,8 @@ pub fn DeckBo(comptime Deck: type, comptime tag_len: usize) type {
         pub const tag_length = tag_len;
         /// Recommended key length, in bytes.
         pub const key_length = Deck.key_length;
+        /// Minimum key length, in bytes.
+        pub const key_length_min = Deck.key_length_min;
         /// Maximum key length, in bytes.
         pub const key_length_max = Deck.key_length_max;
 

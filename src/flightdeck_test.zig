@@ -155,6 +155,7 @@ fn WithParallelism(comptime Duplex: type, comptime parallelism_: comptime_int) t
 
         pub const block_length = Duplex.block_length;
         pub const key_length = Duplex.key_length;
+        pub const key_length_min = Duplex.key_length_min;
         pub const key_length_max = Duplex.key_length_max;
         pub const Trailer = Duplex.Trailer;
         pub const parallelism = parallelism_;
