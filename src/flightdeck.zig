@@ -713,35 +713,52 @@ inline fn permute(comptime n: comptime_int, comptime rounds: u5, st: *[25]@Vecto
         10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
     };
 
-    for (round_constants[round_constants.len - rounds ..]) |round_constant| {
-        var t: [5]Lanes = undefined;
-        inline for (&t, 0..) |*parity, x| {
-            parity.* = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
-        }
-        inline for (0..5) |x| {
-            const d = t[(x + 4) % 5] ^ math.rotl(Lanes, t[(x + 1) % 5], 1);
-            inline for (0..5) |y| st[5 * y + x] ^= d;
-        }
+    // With 8 states, there are enough registers to write the rounds out, and that's faster.
+    const unrolled = if (n == 8) rounds else 1;
 
-        var last = st[1];
-        comptime var rotation = 0;
-        inline for (pi, 1..) |x, i| {
-            rotation = (rotation + i) % 64;
-            const next = st[x];
-            st[x] = math.rotl(Lanes, last, rotation);
-            last = next;
-        }
+    // Computing the parity of the columns at the end of a round, for the next one, gives faster code than at the start.
+    var parity = columnParity(n, st);
+    var first: usize = round_constants.len - rounds;
+    while (first < round_constants.len) : (first += unrolled) {
+        inline for (0..unrolled) |round| {
+            // Read up front: reading it where it's used makes WebAssembly slower.
+            const round_constant = round_constants[first + round];
 
-        inline for (0..5) |y| {
-            const row = st[5 * y ..][0..5];
-            t = row.*;
-            inline for (row, 0..) |*lanes, x| {
-                lanes.* = t[x] ^ (~t[(x + 1) % 5] & t[(x + 2) % 5]);
+            // Each step writes to a new array, which is also faster than updating the state in place.
+            var a = st.*;
+            inline for (0..5) |x| {
+                const d = parity[(x + 4) % 5] ^ math.rotl(Lanes, parity[(x + 1) % 5], 1);
+                inline for (0..5) |y| a[5 * y + x] ^= d;
             }
-        }
 
-        st[0] ^= @splat(round_constant);
+            var b: [25]Lanes = undefined;
+            b[0] = a[0];
+            comptime var from = 1;
+            comptime var rotation = 0;
+            inline for (pi, 1..) |to, i| {
+                rotation = (rotation + i) % 64;
+                b[to] = math.rotl(Lanes, a[from], rotation);
+                from = to;
+            }
+
+            inline for (0..5) |y| {
+                inline for (0..5) |x| {
+                    st[5 * y + x] = b[5 * y + x] ^ (~b[5 * y + (x + 1) % 5] & b[5 * y + (x + 2) % 5]);
+                }
+            }
+
+            st[0] ^= @splat(round_constant);
+            parity = columnParity(n, st);
+        }
     }
+}
+
+inline fn columnParity(comptime n: comptime_int, st: *const [25]@Vector(n, u64)) [5]@Vector(n, u64) {
+    var parity: [5]@Vector(n, u64) = undefined;
+    inline for (&parity, 0..) |*lanes, x| {
+        lanes.* = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
+    }
+    return parity;
 }
 
 test {
