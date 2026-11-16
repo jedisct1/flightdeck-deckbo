@@ -28,8 +28,8 @@ fn measure(io: Io, size: usize, context: anytype, comptime op: fn (@TypeOf(conte
             iterations += 16;
         }
         const bytes: f64 = @floatFromInt(iterations * size);
-        const seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s;
-        best = @max(best, bytes / seconds / (1 << 20));
+        const nanoseconds: f64 = @floatFromInt(elapsed);
+        best = @max(best, bytes / (nanoseconds / std.time.ns_per_s) / (1 << 20));
     }
     return best;
 }

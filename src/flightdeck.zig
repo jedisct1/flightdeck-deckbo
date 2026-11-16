@@ -25,31 +25,43 @@ const KeccakF = crypto.core.keccak.KeccakF;
 
 const max_parallelism = simd.suggestVectorLength(u64) orelse 1;
 
+/// SHAKE128-FlightDeck, a deck cipher with 128 bits of security.
 pub const Shake128FlightDeck = FlightDeck(Shake128Duplex, 5120, 32);
+/// SHAKE256-FlightDeck, a deck cipher with 256 bits of security.
 pub const Shake256FlightDeck = FlightDeck(Shake256Duplex, 8192, 64);
+/// TurboSHAKE128-FlightDeck, about twice as fast as `Shake128FlightDeck`.
 pub const TurboShake128FlightDeck = FlightDeck(TurboShake128Duplex, 5120, 32);
+/// TurboSHAKE256-FlightDeck, about twice as fast as `Shake256FlightDeck`.
 pub const TurboShake256FlightDeck = FlightDeck(TurboShake256Duplex, 8192, 64);
 
+/// The overwrite duplex that is as secure as SHAKE128.
 pub const Shake128Duplex = OverwriteDuplex(128, 24, 0x9f);
+/// The overwrite duplex that is as secure as SHAKE256.
 pub const Shake256Duplex = OverwriteDuplex(256, 24, 0x9f);
+/// The overwrite duplex that is as secure as TurboSHAKE128.
 pub const TurboShake128Duplex = OverwriteDuplex(128, 12, 0x80);
+/// The overwrite duplex that is as secure as TurboSHAKE256.
 pub const TurboShake256Duplex = OverwriteDuplex(256, 12, 0x80);
 
+/// SHAKE128-BO, authenticated encryption with 128 bits of security.
 /// `tag_length` is in bytes, see `DeckBo`.
 pub fn Shake128Bo(comptime tag_length: usize) type {
     return DeckBo(Shake128FlightDeck, tag_length);
 }
 
+/// SHAKE256-BO, authenticated encryption with 256 bits of security.
 /// `tag_length` is in bytes, see `DeckBo`.
 pub fn Shake256Bo(comptime tag_length: usize) type {
     return DeckBo(Shake256FlightDeck, tag_length);
 }
 
+/// TurboSHAKE128-BO, authenticated encryption with 128 bits of security.
 /// `tag_length` is in bytes, see `DeckBo`.
 pub fn TurboShake128Bo(comptime tag_length: usize) type {
     return DeckBo(TurboShake128FlightDeck, tag_length);
 }
 
+/// TurboSHAKE256-BO, authenticated encryption with 256 bits of security.
 /// `tag_length` is in bytes, see `DeckBo`.
 pub fn TurboShake256Bo(comptime tag_length: usize) type {
     return DeckBo(TurboShake256FlightDeck, tag_length);
@@ -75,15 +87,19 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         const Permutation = KeccakF(1600);
         const block_lanes = block_length / 8;
 
+        /// Maximum length of a block, and of the output of a call, in bytes.
         pub const block_length: comptime_int = Permutation.block_bytes - 8 - security_level / 4;
+        /// Recommended key length, in bytes.
         pub const key_length = security_level / 8;
+        /// Maximum key length, in bytes.
         pub const key_length_max = block_length;
+        /// A trailer of up to 5 bits, from 1 to 63.
         pub const Trailer = u6;
 
         st: Permutation = .{},
         offset: usize = block_length,
 
-        /// Nothing can be squeezed before the first call to `duplex`.
+        /// Set the key. Nothing can be squeezed before the first call to `duplex()`.
         pub fn init(key: []const u8) Self {
             assert(key.len <= key_length_max);
             var self: Self = .{};
@@ -92,7 +108,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
             return self;
         }
 
-        /// A clone that can only call `duplex`: it can't squeeze what's left of the current output.
+        /// A clone that can only call `duplex()`: it can't squeeze what's left of the current output.
         pub fn cloneCompact(self: *const Self) Self {
             var clone = self.*;
             clone.st.clear(0, block_length);
@@ -121,7 +137,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
             self.offset = out.len;
         }
 
-        /// Squeeze more bytes after a call to `duplex`, up to `block_length` bytes in total.
+        /// Squeeze more bytes after a call to `duplex()`, up to `block_length` bytes in total.
         pub fn squeeze(self: *Self, out: []u8) void {
             assert(out.len <= block_length - self.offset);
 
@@ -135,7 +151,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
             self.offset += out.len;
         }
 
-        /// Like `squeeze`, but XOR the output with `in`. They can be the same buffer.
+        /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
         pub fn xor(self: *Self, out: []u8, in: []const u8) void {
             assert(out.len == in.len);
             assert(in.len <= block_length - self.offset);
@@ -159,6 +175,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
                 st: [25]@Vector(n, u64),
 
+                /// Make `n` compact clones of `d`.
                 pub fn init(d: *const Self) Clones {
                     var self: Clones = undefined;
                     inline for (&self.st, d.st.st, 0..) |*lanes, lane, i| {
@@ -170,10 +187,14 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
                 /// A compact clone of the clone `i`.
                 pub fn get(self: *const Clones, i: usize) Self {
                     var d: Self = .{};
-                    inline for (&d.st.st, self.st) |*lane, lanes| lane.* = @as([n]u64, lanes)[i];
+                    inline for (&d.st.st, self.st) |*lane, lanes| {
+                        const clones: [n]u64 = lanes;
+                        lane.* = clones[i];
+                    }
                     return d;
                 }
 
+                /// Make each clone absorb its own block.
                 pub inline fn duplex(self: *Clones, comptime len: usize, blocks: [n]*const [len]u8, trailer: Trailer) void {
                     comptime assert(len <= block_length);
 
@@ -189,8 +210,9 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
                         }
                         self.overwrite(padded_blocks);
                     }
-                    const d: u64 = appendBit(trailer, @intFromBool(len == block_length));
-                    self.st[block_lanes] ^= @splat(d | (@as(u64, padding) << 56));
+                    const first: u64 = appendBit(trailer, @intFromBool(len == block_length));
+                    const last: u64 = padding;
+                    self.st[block_lanes] ^= @splat(first | (last << 56));
                     permute(n, rounds, &self.st);
                 }
 
@@ -199,6 +221,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
                     self.output(len, out, null);
                 }
 
+                /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
                 pub fn xor(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
                     self.output(len, out, in);
                 }
@@ -221,7 +244,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
                     }
                 }
 
-                /// The reverse of `overwrite`.
+                /// The reverse of `overwrite()`.
                 inline fn output(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: ?*const [n * len]u8) void {
                     comptime assert(len <= block_length);
                     @setEvalBranchQuota(100_000);
@@ -296,7 +319,9 @@ fn FlightDeckBatched(
         const last_block_length = (chunk_length - 1) % block_length + 1;
         const no_output = math.maxInt(u64);
 
+        /// Recommended key length, in bytes.
         pub const key_length = Duplex.key_length;
+        /// Maximum key length, in bytes.
         pub const key_length_max = Duplex.key_length_max;
         /// A trailer of up to 4 bits, from 1 to 31.
         pub const Trailer = @Int(.unsigned, @bitSizeOf(Duplex.Trailer) - 1);
@@ -306,12 +331,12 @@ fn FlightDeckBatched(
         block: [block_length]u8 = undefined,
         offset: u64 = no_output,
 
-        /// Nothing can be squeezed before the first call to `duplex`.
+        /// Set the key. Nothing can be squeezed before the first call to `duplex()`.
         pub fn init(key: []const u8) Self {
             return .{ .d = .init(key) };
         }
 
-        /// A clone that can only call `duplex`: it can't squeeze what's left of the current output.
+        /// A clone that can only call `duplex()`: it can't squeeze what's left of the current output.
         pub fn cloneCompact(self: *const Self) Self {
             return .{ .d = self.d.cloneCompact() };
         }
@@ -393,13 +418,13 @@ fn FlightDeckBatched(
             self.squeeze(out);
         }
 
-        /// Squeeze more bytes after a call to `duplex`.
+        /// Squeeze more bytes after a call to `duplex()`.
         pub fn squeeze(self: *Self, out: []u8) void {
             @memset(out, 0);
             self.xor(out, out);
         }
 
-        /// Like `squeeze`, but XOR the output with `in`. They can be the same buffer.
+        /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
         pub fn xor(self: *Self, out: []u8, in: []const u8) void {
             assert(out.len == in.len);
             assert(self.offset != no_output);
@@ -498,7 +523,7 @@ fn FlightDeckBatched(
             d.duplex(&.{}, left, last_trailer);
         }
 
-        /// Like `absorb`, for a string that comes in pieces.
+        /// Like `absorb()`, for a string that comes in pieces.
         const Root = struct {
             d: *Duplex,
             buf: [block_length]u8 = undefined,
@@ -545,16 +570,21 @@ pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
     return struct {
         const Self = @This();
 
+        /// Length of the authentication tag, in bytes.
         pub const tag_length = tag_length_;
+        /// Recommended key length, in bytes.
         pub const key_length = Deck.key_length;
+        /// Maximum key length, in bytes.
         pub const key_length_max = Deck.key_length_max;
 
         deck: Deck,
 
+        /// Start a session.
         pub fn init(key: []const u8) Self {
             return .{ .deck = .init(key) };
         }
 
+        /// Encrypt the next message of the session.
         /// `c`: ciphertext, same length as `m`. They can be the same buffer.
         /// `tag`: authentication tag
         /// `m`: message
@@ -573,6 +603,7 @@ pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
             keystream.xor(c, m);
         }
 
+        /// Decrypt the next message of the session.
         /// `m`: message, same length as `c`. They can be the same buffer.
         /// `c`: ciphertext
         /// `tag`: authentication tag
@@ -606,7 +637,8 @@ pub fn DeckBo(comptime Deck: type, comptime tag_length_: usize) type {
 fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trailer)) + 1) {
     const Extended = @Int(.unsigned, @bitSizeOf(@TypeOf(trailer)) + 1);
     assert(trailer != 0);
-    const end = @as(Extended, 1) << math.log2_int(@TypeOf(trailer), trailer);
+    const one: Extended = 1;
+    const end = one << math.log2_int(@TypeOf(trailer), trailer);
     return trailer + (end << bit);
 }
 
@@ -733,7 +765,8 @@ fn ReferenceFlightDeck(comptime Duplex: type, comptime alpha: usize, comptime c:
             var left = r.items;
             while (left.len > rho) : (left = left[rho..]) self.d.duplex(&.{}, left[0..rho], 1);
             // E||1
-            self.d.duplex(&.{}, left, @as(u6, e) + (@as(u6, 2) << math.log2_int(u5, e)));
+            const two: u6 = 2;
+            self.d.duplex(&.{}, left, e + (two << math.log2_int(u5, e)));
             self.o = 0;
             self.squeezing(z);
         }
