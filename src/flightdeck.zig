@@ -473,15 +473,10 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
                         } else {
                             var batch: [batch_length]u8 = undefined;
                             clones.squeeze(block_length, &batch);
-                            // Whole vectors, since a loop over the slices is slow when `out` is `in`.
-                            const Block = @Vector(block_length, u8);
-                            for (0..left / block_length) |j| {
-                                const x: Block = in[i..][0..block_length].*;
-                                const k: Block = batch[j * block_length ..][0..block_length].*;
-                                out[i..][0..block_length].* = x ^ k;
-                                offset += block_length;
-                                i += block_length;
-                            }
+                            const whole = left - left % block_length;
+                            for (out[i..][0..whole], in[i..][0..whole], batch[0..whole]) |*o, x, k| o.* = x ^ k;
+                            offset += whole;
+                            i += whole;
                             // The clone of a last, shorter block is kept for the next call.
                             if (i < in.len) {
                                 self.d_squeeze = clones.get(needed - 1);
@@ -649,6 +644,7 @@ pub fn DeckBo(comptime Deck: type, comptime tag_len: usize) type {
     };
 }
 
+/// Append a bit to a trailer.
 fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trailer)) + 1) {
     const Extended = @Int(.unsigned, @bitSizeOf(@TypeOf(trailer)) + 1);
     assert(trailer != 0);
@@ -657,6 +653,7 @@ fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trail
     return trailer + (end << bit);
 }
 
+/// Transpose a square matrix, given as rows.
 fn transpose(comptime n: comptime_int, rows: *[n]@Vector(n, u64)) void {
     comptime assert(n >= 2 and math.isPowerOfTwo(n));
     const half = n / 2;
