@@ -1,26 +1,13 @@
 # FlightDeck for Zig
 
-FlightDeck is a keyed function that can chew through long inputs and produce long outputs in parallel.
-This is a Zig implementation of it.
-
-You also get the two things around it: the overwrite duplex it's built on, and the Deck-BO authenticated encryption mode that goes on top.
-
-It's plain Zig: no dependencies besides the standard library, no assembly.
-It uses SIMD wherever your target has it, WebAssembly included.
-
-FlightDeck comes from "Parallelizable modes for duplex-based authenticated encryption" by Joan Daemen, Silvia Mella and Gilles Van Assche.
-
-The overwrite duplex and Deck-BO come from "Shaking up authenticated encryption" by Joan Daemen, Seth Hoffert, Silvia Mella, Gilles Van Assche and Ronny Van Keer.
+A Zig implementation of FlightDeck and Deck-BO for encrypting and authenticating data.
+Written entirely in Zig, with no dependencies beyond the standard library.
 
 ## What's in there
 
-```text
-| Layer             | Types                                                                                              |
-|-------------------+----------------------------------------------------------------------------------------------------|
-| Duplex cipher     | `Shake128Duplex`, `Shake256Duplex`, `TurboShake128Duplex`, `TurboShake256Duplex`                   |
-| Deck cipher       | `Shake128FlightDeck`, `Shake256FlightDeck`, `TurboShake128FlightDeck`, `TurboShake256FlightDeck`   |
-| Authenticated enc | `Shake128Bo(tag_length)`, `Shake256Bo(...)`, `TurboShake128Bo(...)`, `TurboShake256Bo(...)`        |
-```
+- Duplex cipher: `Shake128Duplex`, `Shake256Duplex`, `TurboShake128Duplex`, `TurboShake256Duplex`.
+- Deck cipher: `Shake128FlightDeck`, `Shake256FlightDeck`, `TurboShake128FlightDeck`, `TurboShake256FlightDeck`.
+- Authenticated encryption: `Shake128Bo(tag_length)`, `Shake256Bo(...)`, `TurboShake128Bo(...)`, `TurboShake256Bo(...)`.
 
 Not sure which layer you need? Here's what each one does:
 
@@ -127,3 +114,9 @@ That said, any byte string of at most `key_length_max` bytes is accepted, which 
 zig build test     # run the tests
 zig build bench    # measure the throughput
 ```
+
+## Papers
+
+FlightDeck comes from ["Parallelizable modes for duplex-based authenticated encryption"](https://eprint.iacr.org/2026/2801) by Joan Daemen, Silvia Mella and Gilles Van Assche.
+
+The overwrite duplex and Deck-BO come from ["Shaking up authenticated encryption"](https://eprint.iacr.org/2024/1618) by Joan Daemen, Seth Hoffert, Silvia Mella, Gilles Van Assche and Ronny Van Keer.
