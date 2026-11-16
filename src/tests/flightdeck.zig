@@ -212,6 +212,41 @@ fn WithParallelism(comptime Duplex: type, comptime parallel_blocks: comptime_int
     };
 }
 
+// A duplex cipher that can't run clones in parallel.
+fn WithoutParallel(comptime Duplex: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const block_length = Duplex.block_length;
+        pub const key_length = Duplex.key_length;
+        pub const key_length_min = Duplex.key_length_min;
+        pub const key_length_max = Duplex.key_length_max;
+        pub const Trailer = Duplex.Trailer;
+
+        d: Duplex,
+
+        pub fn init(key: []const u8) Self {
+            return .{ .d = .init(key) };
+        }
+
+        pub fn cloneCompact(self: *const Self) Self {
+            return .{ .d = self.d.cloneCompact() };
+        }
+
+        pub fn duplex(self: *Self, out: []u8, in: []const u8, trailer: Trailer) void {
+            self.d.duplex(out, in, trailer);
+        }
+
+        pub fn squeeze(self: *Self, out: []u8) void {
+            self.d.squeeze(out);
+        }
+
+        pub fn xor(self: *Self, out: []u8, in: []const u8) void {
+            self.d.xor(out, in);
+        }
+    };
+}
+
 // FlightDeck as written in Algorithm 3 of the paper.
 fn ReferenceFlightDeck(comptime Duplex: type, comptime alpha: usize, comptime c: usize) type {
     const rho = Duplex.block_length;
@@ -283,13 +318,14 @@ test "FlightDeck against the reference algorithm" {
         const rho = Duplex.block_length;
 
         var reference: ReferenceFlightDeck(Duplex, alpha, c) = .{ .d = .init("key") };
-        // Every batch size, including the ones the target wouldn't pick.
+        // Every batch size, including the ones the target wouldn't pick, and a duplex without `Parallel()`.
         var decks: struct {
+            FlightDeck(WithoutParallel(Duplex), alpha, c),
             FlightDeck(WithParallelism(Duplex, 1), alpha, c),
             FlightDeck(WithParallelism(Duplex, 2), alpha, c),
             FlightDeck(WithParallelism(Duplex, 4), alpha, c),
             FlightDeck(WithParallelism(Duplex, 8), alpha, c),
-        } = .{ .init("key"), .init("key"), .init("key"), .init("key") };
+        } = .{ .init("key"), .init("key"), .init("key"), .init("key"), .init("key") };
 
         const in = try allocator.alloc(u8, 18 * alpha + rho + 1);
         defer allocator.free(in);

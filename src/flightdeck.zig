@@ -290,7 +290,7 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
 /// The FlightDeck deck cipher: like a duplex cipher (see `OverwriteDuplex`), with inputs and outputs of any length.
 ///
-/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel()` and `optimal_parallel_blocks` are optional.
+/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel()` is optional, and comes with `optimal_parallel_blocks`.
 /// Long inputs are cut into chunks of `chunk_length` bytes, each summed up in `chaining_value_length` bytes.
 pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime chaining_value_length: usize) type {
     const block_length = Duplex.block_length;
@@ -313,7 +313,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
         const blocks_per_chunk = @divCeil(chunk_length, block_length);
         const last_block_length = (chunk_length - 1) % block_length + 1;
 
-        const no_trailer = 0b1;
+        const empty_trailer = 0b1;
         const counter_trailer = 0b10;
         const chaining_value_trailer = 0b100;
 
@@ -375,7 +375,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
                             while (true) : (done += block_length) {
                                 if (tail_length != 0 and done == tail_length) tail = clones.get(count);
                                 if (done == chunk_length - last_block_length) break;
-                                clones.duplex(block_length, blocksOf(n, block_length, chunks, count, tail_length, done), no_trailer);
+                                clones.duplex(block_length, blocksOf(n, block_length, chunks, count, tail_length, done), empty_trailer);
                             }
                             if (first) {
                                 // The first clone played the main duplex. The end of its chunk may share a block with chaining values.
@@ -522,7 +522,7 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
         fn absorb(d: *Duplex, in: []const u8, last_trailer: Duplex.Trailer) void {
             var left = in;
             while (left.len > block_length) : (left = left[block_length..]) {
-                d.duplex(&.{}, left[0..block_length], no_trailer);
+                d.duplex(&.{}, left[0..block_length], empty_trailer);
             }
             d.duplex(&.{}, left, last_trailer);
         }
@@ -544,10 +544,10 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
                     self.len += n;
                     left = left[n..];
                     if (left.len == 0) return;
-                    self.d.duplex(&.{}, &self.buf, no_trailer);
+                    self.d.duplex(&.{}, &self.buf, empty_trailer);
                 }
                 while (left.len > block_length) : (left = left[block_length..]) {
-                    self.d.duplex(&.{}, left[0..block_length], no_trailer);
+                    self.d.duplex(&.{}, left[0..block_length], empty_trailer);
                 }
                 @memcpy(self.buf[0..left.len], left);
                 self.len = left.len;
