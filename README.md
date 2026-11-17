@@ -36,7 +36,7 @@ The 128 and 256 in the names are the security levels, in bits.
 Add the package to your `build.zig.zon`:
 
 ```sh
-zig fetch --save git+https://github.com/jedisct1/flightdeck-deckbo
+zig fetch --save git+https://github.com/jedisct1/zig-flightdeck
 ```
 
 Then make the module available to your code, in `build.zig`:
