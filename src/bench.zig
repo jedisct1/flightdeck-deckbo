@@ -1,4 +1,4 @@
-//! Throughput of the FlightDeck instances and of the authenticated encryption schemes built on them.
+//! Throughput of the FlightDeck instances, with a key and as hash functions, and of the authenticated encryption schemes built on them.
 //!
 //! zig build bench
 
@@ -64,6 +64,17 @@ fn squeeze(comptime Deck: type) fn (*Buffers(Deck)) void {
     }.op;
 }
 
+fn hash(comptime Deck: type) fn (*Buffers(Deck)) void {
+    return struct {
+        fn op(b: *Buffers(Deck)) void {
+            var deck: Deck = .init("");
+            var digest: [2 * Deck.key_length]u8 = undefined;
+            deck.duplex(&digest, b.in, 1);
+            mem.doNotOptimizeAway(&digest);
+        }
+    }.op;
+}
+
 fn encrypt(comptime Aead: type) fn (*Buffers(Aead)) void {
     return struct {
         fn op(b: *Buffers(Aead)) void {
@@ -105,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "SHAKE128-FlightDeck", flightdeck.Shake128FlightDeck },
         .{ "SHAKE256-FlightDeck", flightdeck.Shake256FlightDeck },
     };
-    inline for (.{ "input", "output" }, .{ absorb, squeeze }) |direction, op| {
+    inline for (.{ "input", "output", "hash" }, .{ absorb, squeeze, hash }) |direction, op| {
         inline for (decks) |deck| {
             const name, const Deck = deck;
             try stdout.print("{s:<34}", .{name ++ " " ++ direction});
