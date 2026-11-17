@@ -108,6 +108,92 @@ Keys are normally `key_length` random bytes: 16 for the 128-bit instances and 32
 
 That said, any byte string of at most `key_length_max` bytes is accepted, which is 160 and 128 bytes respectively.
 
+## Sessions
+
+A session is a value like any other.
+`init()` starts it, everything you encrypt, decrypt or absorb moves it forward, and you keep it around for as long as the conversation lasts, one on each side.
+
+Encrypting a message and decrypting it leave a session in the same state.
+So a single session can carry both directions, as long as the two sides take turns:
+
+```zig
+const Aead = flightdeck.TurboShake128Bo(16);
+
+var alice: Aead = .init(key);
+var bob: Aead = .init(key);
+
+var buffer: [4]u8 = undefined;
+var tag: [Aead.tag_length]u8 = undefined;
+
+alice.encrypt(&buffer, &tag, "ping", "");
+try bob.decrypt(&buffer, &buffer, tag, "");
+
+bob.encrypt(&buffer, &tag, "pong", "");
+try alice.decrypt(&buffer, &buffer, tag, "");
+```
+
+If both sides can send whenever they want, their messages can cross and the two sessions stop matching.
+In that case, use two sessions, one for each direction, each with its own key. There's an example below.
+
+`absorb()` mixes something into a session without sending a ciphertext: a session identifier, a nonce, the transcript of a handshake.
+Both sides have to absorb the same thing at the same point.
+
+`squeeze()` gives you bytes that depend on the key and on everything that happened in the session so far.
+Both sides get the same ones, so that's how you make new keys out of a session.
+
+```zig
+alice.absorb("session 1234");
+bob.absorb("session 1234");
+
+var alice_key: [32]u8 = undefined;
+var bob_key: [32]u8 = undefined;
+alice.squeeze(&alice_key);
+bob.squeeze(&bob_key);
+// alice_key and bob_key are the same.
+```
+
+All of this happens on the same state, in any order you like: encrypt, decrypt, absorb, squeeze.
+The only rule is that the two sides go through the same messages and the same `absorb()` calls, in the same order.
+
+Squeezing is not part of that, because it doesn't move the session: what comes next is the same whether you squeezed or not.
+Squeeze again and you get the bytes that follow, not the same ones, until the next message or `absorb()`.
+There has to be something in the session first: on a brand new one, `squeeze()` hits an assertion.
+
+An `absorb()` is just an empty message, whose tag is thrown away.
+If you'd rather have the other side check what it absorbed, send that tag instead:
+
+```zig
+alice.encrypt(&.{}, &tag, &.{}, "session 1234");
+try bob.decrypt(&.{}, &.{}, tag, "session 1234");
+```
+
+What you squeeze comes after the tag of the last message, and never includes it.
+So tags can travel in the clear and squeezed bytes can stay secret.
+
+A few more things to know:
+
+- A message that doesn't authenticate doesn't move the session.
+  So a forged or damaged one does no harm: the real one still decrypts after it.
+- A message that gets lost or comes out of order is another story: what was sent after it doesn't decrypt until it shows up.
+  So sessions need a transport that delivers everything, in order.
+- Copying the instance copies the session, to save it or to try something on the side.
+- Messages and `absorb()` are Deck-BO as the paper specifies it.
+  `squeeze()` is an addition, so don't expect it from other implementations.
+
+Back to the two directions that don't take turns.
+Squeeze two keys from a session both sides share, and start one session for each direction.
+Here's the client. The server does the same thing with the two keys swapped:
+
+```zig
+var keys: [32]u8 = undefined;
+handshake.squeeze(&keys);
+
+const client_to_server = keys[0..16];
+const server_to_client = keys[16..];
+var sending: Aead = .init(client_to_server);
+var receiving: Aead = .init(server_to_client);
+```
+
 ## Running the tests
 
 ```sh

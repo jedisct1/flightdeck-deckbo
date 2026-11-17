@@ -466,3 +466,41 @@ test "DeckBo authentication failure" {
     try testing.expectEqualSlices(u8, m, &out);
     try testing.expectError(error.AuthenticationFailed, receiver.decrypt(&out, &c, tag, ad));
 }
+
+test "DeckBo absorb and squeeze" {
+    const Aead = TurboShake128Bo(16);
+    var sender: Aead = .init("key");
+    var receiver = sender;
+
+    // The squeezed bytes are the end of the tag a session with longer tags gives.
+    var long_tags: TurboShake128Bo(48) = .init("key");
+    var long_tag: [48]u8 = undefined;
+    long_tags.encrypt(&.{}, &long_tag, &.{}, "data");
+    sender.absorb("data");
+    var squeezed: [32]u8 = undefined;
+    sender.squeeze(squeezed[0..5]);
+    sender.squeeze(squeezed[5..]);
+    try testing.expectEqualSlices(u8, long_tag[16..], &squeezed);
+
+    // An absorb is an empty message, so the other side can check it.
+    try receiver.decrypt(&.{}, &.{}, long_tag[0..16].*, "data");
+
+    // Only the sender squeezed, and the next message still decrypts.
+    // Both sides then squeeze the same bytes, and a message that's rejected doesn't change them.
+    const m = "a message";
+    var c: [m.len]u8 = undefined;
+    var tag: [Aead.tag_length]u8 = undefined;
+    sender.encrypt(&c, &tag, m, "");
+    try receiver.decrypt(&c, &c, tag, "");
+    var expected: [400]u8 = undefined;
+    sender.squeeze(&expected);
+    var long_c: [m.len]u8 = undefined;
+    long_tags.encrypt(&long_c, &long_tag, m, "");
+    try testing.expectEqualSlices(u8, long_tag[16..], expected[0..32]);
+
+    var output: [400]u8 = undefined;
+    receiver.squeeze(output[0..170]);
+    try testing.expectError(error.AuthenticationFailed, receiver.decrypt(&c, &c, tag, ""));
+    receiver.squeeze(output[170..]);
+    try testing.expectEqualSlices(u8, &expected, &output);
+}

@@ -577,6 +577,13 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
 /// There is no nonce, so the same message at the same point of a session gets the same ciphertext.
 /// If that's a problem, put a nonce or a counter in the associated data.
 ///
+/// Keep one instance on each side, and call it for every message, in the same order.
+/// Encrypting a message and decrypting it leave it in the same state,
+/// so one session can carry both directions when the two sides take turns.
+/// When they don't, use one session for each direction, each with its own key.
+///
+/// Between messages, `absorb()` mixes data into the session, and `squeeze()` gets bytes out of it, to make new keys for instance.
+///
 /// `tag_len` is in bytes. A forgery succeeds with probability 2^-(8 * tag_len).
 /// A tag twice as long as the security level, 32 bytes for 128 bits, also commits to the key, the associated data and the message.
 pub fn DeckBo(comptime Deck: type, comptime tag_len: usize) type {
@@ -604,6 +611,28 @@ pub fn DeckBo(comptime Deck: type, comptime tag_len: usize) type {
         /// Start a session.
         pub fn init(key: []const u8) Self {
             return .{ .deck = .init(key) };
+        }
+
+        /// Mix `data` into the session, without sending anything.
+        /// Both sides have to absorb the same data at the same point of the session.
+        ///
+        /// It's an empty message whose tag is thrown away.
+        /// To let the other side check the data, send it the tag of that empty message instead.
+        pub fn absorb(self: *Self, data: []const u8) void {
+            var tag: [tag_length]u8 = undefined;
+            self.encrypt(&.{}, &tag, &.{}, data);
+        }
+
+        /// Get bytes that depend on the key and on everything that happened in the session so far.
+        /// Both sides get the same ones, so that's how to make new keys out of a session.
+        ///
+        /// These bytes come after the tag of the last message, and never include it.
+        /// Squeezing doesn't move the session: what comes next is the same whether you squeezed or not.
+        /// Squeezing again continues where the last call stopped, until the next message or `absorb()`.
+        ///
+        /// Something has to happen in the session before the first call.
+        pub fn squeeze(self: *Self, out: []u8) void {
+            self.deck.squeeze(out);
         }
 
         /// Encrypt the next message of the session.
