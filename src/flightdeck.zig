@@ -14,6 +14,7 @@
 //! Overwrite duplex and Deck-BO: https://eprint.iacr.org/2024/1618
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const crypto = std.crypto;
 const math = std.math;
@@ -76,13 +77,16 @@ pub fn TurboShake256Bo(comptime tag_len: usize) type {
 /// `padding` is the last byte of a block of the sponge function whose security it matches.
 pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, comptime padding: u8) type {
     comptime assert(security_level > 0 and security_level <= 256 and security_level % 32 == 0);
-    comptime assert(rounds <= KeccakF(1600).max_rounds);
+    comptime assert(rounds > 0 and rounds <= KeccakF(1600).max_rounds);
     comptime assert(padding & 0x80 != 0);
 
     return struct {
         const Self = @This();
 
         const Permutation = KeccakF(1600);
+        const block_lanes = block_length / 8;
+        const permutation_rounds = rounds;
+        const sponge_padding = padding;
 
         /// Maximum length of a block, and of the output of a call, in bytes.
         pub const block_length: comptime_int = Permutation.block_bytes - 8 - security_level / 4;
@@ -100,11 +104,20 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
         st: Permutation = .{},
         offset: usize = block_length,
 
+        // Computed once, so that hashing doesn't pay for absorbing an empty key.
+        const after_empty_key = after_empty_key: {
+            @setEvalBranchQuota(100_000);
+            var d: Self = .{};
+            d.absorb(&.{}, 0b1);
+            break :after_empty_key d.st;
+        };
+
         /// Set the key. Nothing can be squeezed before the first call to `duplex()`.
         pub fn init(key: []const u8) Self {
             assert(key.len <= key_length_max);
+            if (key.len == 0) return .{ .st = after_empty_key };
             var self: Self = .{};
-            self.duplex(&.{}, key, 0b1);
+            self.absorb(key, 0b1);
             self.offset = block_length;
             return self;
         }
@@ -124,18 +137,30 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
             if (in.len == block_length) {
                 self.st.setBytes(in);
-                self.st.addByte(appendBit(trailer, 1), block_length);
             } else {
                 self.st.clear(0, block_length);
                 self.st.setBytes(in);
                 self.st.addByte(0x01, in.len);
-                self.st.addByte(appendBit(trailer, 0), block_length);
             }
-            self.st.addByte(padding, block_length + 7);
-            self.st.permuteR(rounds);
+            self.st.st[block_lanes] ^= trailerLane(padding, trailer, in.len == block_length);
+            permuteState(rounds, &self.st.st);
 
             self.st.extractBytes(out);
             self.offset = out.len;
+        }
+
+        /// Absorb `in`, of any length, block by block, like calls to `duplex()` that squeeze nothing.
+        /// The last block gets `trailer`, the others the empty trailer.
+        /// It's faster than calling `duplex()` for each block.
+        pub fn absorb(self: *Self, in: []const u8, trailer: Trailer) void {
+            const count = if (in.len == 0) 0 else (in.len - 1) / block_length;
+            const rest = in[count * block_length ..];
+            const last: LastBlocks(1) = .{
+                .blocks = .{rest},
+                .trailers = .{trailerLane(padding, trailer, rest.len == block_length)},
+            };
+            absorbBlocks(Self, 1, 25, @ptrCast(&self.st.st), .{in.ptr}, count, &last);
+            self.offset = 0;
         }
 
         /// Squeeze more bytes after a call to `duplex()`, up to `block_length` bytes in total.
@@ -172,136 +197,142 @@ pub fn OverwriteDuplex(comptime security_level: u11, comptime rounds: u5, compti
 
         /// `n` compact clones of a duplex cipher, processed together using vectors. `n` is a power of two.
         pub fn Parallel(comptime n: comptime_int) type {
-            return ParallelOverwriteDuplex(Self, n, rounds, padding);
+            return ParallelOverwriteDuplex(Self, n);
         }
     };
 }
 
-fn ParallelOverwriteDuplex(comptime Duplex: type, comptime n: comptime_int, comptime rounds: u5, comptime padding: u8) type {
-    comptime assert(n >= 2 and math.isPowerOfTwo(n));
+fn ParallelOverwriteDuplex(comptime Duplex: type, comptime n: comptime_int) type {
+    comptime assert(math.isPowerOfTwo(n));
 
     const block_length = Duplex.block_length;
-    const block_lanes = block_length / 8;
+    const block_lanes = Duplex.block_lanes;
+    const rounds = Duplex.permutation_rounds;
+    const padding = Duplex.sponge_padding;
 
     return struct {
         const Self = @This();
 
-        st: [25]@Vector(n, u64),
+        /// Lane `i` of every clone. Only the lanes after the block are kept between calls.
+        st: [25][n]u64,
 
         /// Make `n` compact clones of `d`.
         pub fn init(d: *const Duplex) Self {
             var self: Self = undefined;
-            inline for (&self.st, d.st.st, 0..) |*lanes, lane, i| {
-                lanes.* = @splat(if (i < block_lanes) 0 else lane);
-            }
+            for (self.st[block_lanes..], d.st.st[block_lanes..]) |*lanes, lane| lanes.* = @splat(lane);
             return self;
         }
 
-        /// The clone `i`, as a duplex cipher of its own.
+        /// Turn clone `i` into a compact clone of `d`.
+        pub fn set(self: *Self, i: usize, d: *const Duplex) void {
+            for (self.st[block_lanes..], d.st.st[block_lanes..]) |*lanes, lane| lanes[i] = lane;
+        }
+
+        /// Clone `i`, as a compact clone.
         pub fn get(self: *const Self, i: usize) Duplex {
-            var d: Duplex = .{ .offset = 0 };
-            inline for (&d.st.st, self.st) |*lane, lanes| {
-                const clones: [n]u64 = lanes;
-                lane.* = clones[i];
-            }
+            var d: Duplex = .{};
+            for (d.st.st[block_lanes..], self.st[block_lanes..]) |*lane, lanes| lane.* = lanes[i];
             return d;
         }
 
-        /// Make each clone absorb its own block.
-        /// Inlined so that the states stay in registers from one block to the next.
-        pub inline fn duplex(self: *Self, comptime len: usize, blocks: [n]*const [len]u8, trailer: Duplex.Trailer) void {
+        /// Make clone `i` absorb `count` full blocks from `blocks[i]`, with the empty trailer.
+        /// The clones stay compact.
+        pub fn absorb(self: *Self, blocks: [n][]const u8, count: usize) void {
+            absorbBlocks(Duplex, n, 0, &self.st, pointers(blocks, count), count, null);
+        }
+
+        /// Like `absorb()`, then make clone `i` absorb `last[i]` with `trailers[i]`,
+        /// and squeeze `len` bytes from each clone into `out`.
+        /// The clones stay compact.
+        pub fn duplex(
+            self: *Self,
+            blocks: [n][]const u8,
+            count: usize,
+            last: [n][]const u8,
+            trailers: [n]Duplex.Trailer,
+            comptime len: usize,
+            out: *[n][len]u8,
+        ) void {
             comptime assert(len <= block_length);
+            const out_lanes = @divCeil(len, 8);
 
-            if (len == block_length) {
-                self.overwrite(blocks);
-            } else {
-                var padded: [n][block_length]u8 = @splat(@splat(0));
-                var padded_blocks: [n]*const [block_length]u8 = undefined;
-                inline for (&padded, &padded_blocks, blocks) |*buf, *padded_block, block| {
-                    buf[0..len].* = block.*;
-                    buf[len] = 0x01;
-                    padded_block.* = buf;
-                }
-                self.overwrite(padded_blocks);
+            var padded: [n][block_length]u8 = undefined;
+            var last_blocks: LastBlocks(n) = undefined;
+            for (&last_blocks.blocks, &last_blocks.trailers, &padded, last, trailers) |*block, *lane, *buf, bytes, trailer| {
+                assert(bytes.len <= block_length);
+                block.* = if (bytes.len == block_length) bytes else padBlock(buf, bytes);
+                lane.* = trailerLane(padding, trailer, bytes.len == block_length);
             }
-            const first: u64 = appendBit(trailer, @intFromBool(len == block_length));
-            const last: u64 = padding;
-            self.st[block_lanes] ^= @splat(first | (last << 56));
-            permute(n, rounds, &self.st);
+            absorbBlocks(Duplex, n, out_lanes, &self.st, pointers(blocks, count), count, &last_blocks);
+
+            for (out, 0..) |*bytes, i| {
+                var lanes: [8 * out_lanes]u8 = undefined;
+                inline for (0..out_lanes) |l| mem.writeInt(u64, lanes[8 * l ..][0..8], self.st[l][i], .little);
+                bytes.* = lanes[0..len].*;
+            }
         }
 
-        /// Squeeze `len` bytes from each clone, one clone after the other.
-        pub fn squeeze(self: *const Self, comptime len: usize, out: *[n * len]u8) void {
-            self.output(len, out, null);
-        }
-
-        /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
-        pub fn xor(self: *const Self, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
-            self.output(len, out, in);
-        }
-
-        /// A vector of the state holds the same lane of every clone, but a block holds consecutive lanes of one clone.
-        /// So load the blocks as rows, and transpose them.
-        inline fn overwrite(self: *Self, blocks: [n]*const [block_length]u8) void {
+        /// Make clone `i` of `d` absorb the number `first + i` with `trailer`.
+        /// The number is a full block: 8 bytes in little-endian order, then zeros.
+        /// Then squeeze a block from each clone into `out`, one after the other.
+        /// They're XORed with `in` if there is one, which can be the same buffer as `out`.
+        pub fn xorCounters(
+            d: *const Duplex,
+            first: u64,
+            trailer: Duplex.Trailer,
+            out: *[n * block_length]u8,
+            in: ?*const [n * block_length]u8,
+        ) void {
             @setEvalBranchQuota(100_000);
+            const V = Lanes(n);
+
+            var counters: [n]u64 = undefined;
+            for (&counters, 0..) |*counter, i| counter.* = first + i;
+            var a: [25]V = undefined;
+            a[0] = fromArray(n, counters);
+            inline for (a[1..block_lanes]) |*lanes| lanes.* = splat(V, 0);
+            a[block_lanes] = splat(V, d.st.st[block_lanes] ^ trailerLane(padding, trailer, true));
+            inline for (a[block_lanes + 1 ..], d.st.st[block_lanes + 1 ..]) |*lanes, lane| lanes.* = splat(V, lane);
+            // Out of the loop, the first round gets simpler: most lanes are still zero.
+            var c = columnParity(V, &a);
+            round(V, &a, &c, round_constants[24 - rounds], laneRange(0, 25), false);
+            roundsBetween(V, 25 - rounds, &a, &c);
+            round(V, &a, &c, round_constants[23], laneRange(0, block_lanes), true);
+
+            if (n == 1) {
+                inline for (a[0..block_lanes], 0..) |lanes, l| {
+                    storeLanes(1, 8, toArray(1, lanes), out[8 * l ..][0..8], if (in) |src| src[8 * l ..][0..8] else null);
+                }
+                return;
+            }
             comptime var from = 0;
             inline while (from < block_lanes) : (from += n) {
                 const count: comptime_int = @min(n, block_lanes - from);
-                var rows: [n]@Vector(n, u64) = undefined;
-                inline for (&rows, blocks) |*row, block| {
-                    var lanes: [n]u64 = @splat(0);
-                    lanes[0..count].* = mem.littleToNative(@Vector(count, u64), mem.bytesToValue([count]u64, block[8 * from ..][0 .. 8 * count]));
-                    row.* = lanes;
-                }
+                var rows: [n]V = @splat(@splat(0));
+                rows[0..count].* = a[from..][0..count].*;
                 transpose(n, &rows);
-                self.st[from..][0..count].* = rows[0..count].*;
+                inline for (rows, 0..) |row, i| {
+                    const at = i * block_length + 8 * from;
+                    storeLanes(n, 8 * count, row, out[at..][0 .. 8 * count], if (in) |src| src[at..][0 .. 8 * count] else null);
+                }
             }
         }
 
-        /// The reverse of `overwrite()`.
-        inline fn output(self: *const Self, comptime len: usize, out: *[n * len]u8, in: ?*const [n * len]u8) void {
-            comptime assert(len <= block_length);
-            @setEvalBranchQuota(100_000);
-
-            comptime var from = 0;
-            inline while (8 * from < len) : (from += n) {
-                const count: comptime_int = @min(n, block_lanes - from);
-                const size: comptime_int = @min(8 * count, len - 8 * from);
-                var rows: [n]@Vector(n, u64) = @splat(@splat(0));
-                rows[0..count].* = self.st[from..][0..count].*;
-                transpose(n, &rows);
-                inline for (rows, 0..) |row, i| {
-                    const at = i * len + 8 * from;
-                    storeLanes(n, size, row, out[at..][0..size], if (in) |src| src[at..][0..size] else null);
-                }
+        fn pointers(blocks: [n][]const u8, count: usize) [n][*]const u8 {
+            var ptrs: [n][*]const u8 = undefined;
+            for (&ptrs, blocks) |*ptr, bytes| {
+                assert(bytes.len >= count * block_length);
+                ptr.* = bytes.ptr;
             }
+            return ptrs;
         }
     };
 }
 
-/// Store the first `size` bytes of `lanes`, XORed with `in` if there is one.
-inline fn storeLanes(comptime n: comptime_int, comptime size: comptime_int, lanes: [n]u64, out: *[size]u8, in: ?*const [size]u8) void {
-    const whole = size / 8;
-    const rest = size % 8;
-    if (whole > 0) {
-        const Whole = @Vector(whole, u64);
-        var part: Whole = lanes[0..whole].*;
-        if (in) |src| part ^= mem.littleToNative(Whole, mem.bytesToValue([whole]u64, src[0 .. 8 * whole]));
-        mem.bytesAsValue([whole]u64, out[0 .. 8 * whole]).* = mem.nativeToLittle(Whole, part);
-    }
-    if (rest != 0) {
-        var last: [8]u8 = undefined;
-        mem.writeInt(u64, &last, lanes[whole], .little);
-        if (in) |src| for (last[0..rest], src[8 * whole ..]) |*b, x| {
-            b.* ^= x;
-        };
-        out[8 * whole ..].* = last[0..rest].*;
-    }
-}
-
 /// The FlightDeck deck cipher: like a duplex cipher (see `OverwriteDuplex`), with inputs and outputs of any length.
 ///
-/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`. `Parallel()` is optional, and comes with `optimal_parallel_blocks`.
+/// `Duplex` is a duplex cipher that looks like `OverwriteDuplex`, including `absorb()`.
+/// Its `Parallel()` is optional, and comes with `optimal_parallel_blocks`.
 /// Long inputs are cut into chunks of `chunk_length` bytes, each summed up in `chaining_value_length` bytes.
 pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime chaining_value_length: usize) type {
     const block_length = Duplex.block_length;
@@ -321,12 +352,18 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
             else => &.{ 2, 4, 8 },
         } else &.{};
         const max_batch_size = if (batch_sizes.len == 0) 1 else batch_sizes[batch_sizes.len - 1];
+        // A single output block also goes through `Parallel()`, which is faster than `duplex()`.
+        const output_batch_sizes: []const comptime_int =
+            if (@hasDecl(Duplex, "Parallel")) &[_]comptime_int{1} ++ batch_sizes else &.{};
         const blocks_per_chunk = @divCeil(chunk_length, block_length);
         const last_block_length = (chunk_length - 1) % block_length + 1;
 
         const empty_trailer = 0b1;
         const counter_trailer = 0b10;
         const chaining_value_trailer = 0b100;
+
+        // Room for a batch of chaining values, plus what a flush leaves.
+        const root_buffer_length = @max(4096, max_batch_size * chaining_value_length + block_length);
 
         /// Recommended key length, in bytes.
         pub const key_length = Duplex.key_length;
@@ -338,8 +375,8 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
         pub const Trailer = @Int(.unsigned, @bitSizeOf(Duplex.Trailer) - 1);
 
         d: Duplex,
-        /// A clone of `d` that gives the current output block, after the first one.
-        d_squeeze: Duplex = undefined,
+        /// The output block where the last call stopped, if it wasn't the first one.
+        block: [block_length]u8 = undefined,
         /// How many bytes of output were squeezed, or null before the first call to `duplex()`.
         offset: ?u64 = null,
 
@@ -358,216 +395,211 @@ pub fn FlightDeck(comptime Duplex: type, comptime chunk_length: usize, comptime 
             const last_trailer = appendBit(trailer, 1);
 
             if (in.len <= chunk_length) {
-                absorb(&self.d, in, last_trailer);
+                self.d.absorb(in, last_trailer);
             } else {
-                // Every chunk after the first one starts from this state.
-                const d0 = self.d.cloneCompact();
                 var root: Root = .{ .d = &self.d };
-                var chunks = in;
-                var first = true;
-
-                batches: while (true) {
-                    const full = chunks.len / chunk_length;
-                    // A shorter last chunk can join a batch, except for its last block.
-                    const tail_blocks = (chunks.len % chunk_length -| 1) / block_length;
-                    // A batch doesn't have to be full to be worth it.
-                    // A shorter last chunk only calls for a bigger batch if it's at least half a chunk.
-                    const wanted = full + @intFromBool(2 * tail_blocks >= blocks_per_chunk);
-                    if (wanted < 2) break;
-
-                    inline for (batch_sizes) |n| {
-                        if (wanted <= n or n == max_batch_size) {
-                            const count = @min(full, n);
-                            const tail_length = if (count == full and count < n) tail_blocks * block_length else 0;
-                            var tail: Duplex = undefined;
-
-                            var clones: Duplex.Parallel(n) = .init(&d0);
-                            var done: usize = 0;
-                            while (true) : (done += block_length) {
-                                if (tail_length != 0 and done == tail_length) tail = clones.get(count);
-                                if (done == chunk_length - last_block_length) break;
-                                clones.duplex(block_length, blocksOf(n, block_length, chunks, count, tail_length, done), empty_trailer);
-                            }
-                            if (first) {
-                                // The first clone played the main duplex. The end of its chunk may share a block with chaining values.
-                                self.d = clones.get(0);
-                                root.update(chunks[done..chunk_length]);
-                            }
-                            clones.duplex(last_block_length, blocksOf(n, last_block_length, chunks, count, tail_length, done), chaining_value_trailer);
-
-                            var cvs: [n][chaining_value_length]u8 = undefined;
-                            clones.squeeze(chaining_value_length, mem.asBytes(&cvs));
-                            root.update(mem.sliceAsBytes(cvs[@intFromBool(first)..count]));
-                            chunks = chunks[count * chunk_length ..];
-                            if (tail_length != 0) {
-                                tail.duplex(&cvs[0], chunks[tail_length..], chaining_value_trailer);
-                                root.update(&cvs[0]);
-                                chunks = chunks[chunks.len..];
-                            }
-                            first = false;
-                            continue :batches;
-                        }
-                    }
-                    break;
-                }
-                if (first) {
-                    root.update(chunks[0..chunk_length]);
-                    chunks = chunks[chunk_length..];
-                }
-                while (chunks.len > 0) {
-                    const chunk = chunks[0..@min(chunk_length, chunks.len)];
-                    chunks = chunks[chunk.len..];
-                    var cv: [chaining_value_length]u8 = undefined;
-                    var d = d0;
-                    absorb(&d, chunk, chaining_value_trailer);
-                    d.squeeze(&cv);
-                    root.update(&cv);
-                }
-                root.final(last_trailer);
+                self.absorbChunks(in, &root);
+                self.d.absorb(root.buf[0..root.len], last_trailer);
             }
-
             self.offset = 0;
-            self.squeeze(out);
+            self.output(out, null);
         }
 
         /// Squeeze more bytes after a call to `duplex()`.
         pub fn squeeze(self: *Self, out: []u8) void {
-            @memset(out, 0);
-            self.xor(out, out);
+            self.output(out, null);
         }
 
         /// Like `squeeze()`, but XOR the output with `in`. They can be the same buffer.
         pub fn xor(self: *Self, out: []u8, in: []const u8) void {
             assert(out.len == in.len);
+            self.output(out, in);
+        }
+
+        fn output(self: *Self, out: []u8, in: ?[]const u8) void {
             var offset = self.offset.?;
             defer self.offset = offset;
-            assert(in.len <= math.maxInt(u64) - offset);
+            assert(out.len <= math.maxInt(u64) - offset);
 
             var i: usize = 0;
             if (offset < block_length) {
-                i = @min(block_length - offset, in.len);
-                self.d.xor(out[0..i], in[0..i]);
+                i = @min(block_length - offset, out.len);
+                if (in) |src| self.d.xor(out[0..i], src[0..i]) else self.d.squeeze(out[0..i]);
                 offset += i;
             }
             const used: usize = @intCast(offset % block_length);
-            if (used != 0 and i < in.len) {
-                const n = @min(block_length - used, in.len - i);
-                self.d_squeeze.xor(out[i..][0..n], in[i..][0..n]);
-                offset += n;
-                i += n;
+            if (used != 0 and i < out.len) {
+                const len = @min(block_length - used, out.len - i);
+                xorBytes(out[i..][0..len], if (in) |src| src[i..][0..len] else null, self.block[used..][0..len]);
+                offset += len;
+                i += len;
             }
 
-            if (i == in.len) return;
-
-            // After the first block, each block comes from a compact clone that absorbed its index.
-            var counters: [max_batch_size][block_length]u8 = @splat(@splat(0));
-            batches: while (i < in.len) {
-                const left = in.len - i;
+            // Block `k`, after the first one, comes from a compact clone that absorbed `k`.
+            blocks: while (i < out.len) {
+                const left = out.len - i;
                 const index = offset / block_length;
                 const needed = @divCeil(left, block_length);
 
-                if (needed >= 2) inline for (batch_sizes) |n| {
-                    if (needed <= n or n == max_batch_size) {
-                        var blocks: [n]*const [block_length]u8 = undefined;
-                        inline for (&blocks, counters[0..n], 0..) |*block, *counter, j| {
-                            mem.writeInt(u64, counter[0..8], index + j, .little);
-                            block.* = counter;
-                        }
-                        var clones: Duplex.Parallel(n) = .init(&self.d);
-                        clones.duplex(block_length, blocks, counter_trailer);
-
+                inline for (output_batch_sizes) |n| {
+                    if (n >= needed or n == max_batch_size) {
+                        const Clones = Duplex.Parallel(n);
                         const batch_length = n * block_length;
                         if (left >= batch_length) {
-                            clones.xor(block_length, out[i..][0..batch_length], in[i..][0..batch_length]);
+                            const batch_in = if (in) |src| src[i..][0..batch_length] else null;
+                            Clones.xorCounters(&self.d, index, counter_trailer, out[i..][0..batch_length], batch_in);
                             offset += batch_length;
                             i += batch_length;
                         } else {
                             var batch: [batch_length]u8 = undefined;
-                            clones.squeeze(block_length, &batch);
-                            const whole = left - left % block_length;
-                            for (out[i..][0..whole], in[i..][0..whole], batch[0..whole]) |*o, x, k| o.* = x ^ k;
-                            offset += whole;
-                            i += whole;
-                            // The clone of a last, shorter block is kept for the next call.
-                            if (i < in.len) {
-                                self.d_squeeze = clones.get(needed - 1);
-                                self.d_squeeze.xor(out[i..], in[i..]);
-                                offset += in.len - i;
-                                i = in.len;
-                            }
+                            Clones.xorCounters(&self.d, index, counter_trailer, &batch, null);
+                            xorBytes(out[i..], if (in) |src| src[i..] else null, batch[0..left]);
+                            // Keep an unfinished block for the next call.
+                            if (left % block_length != 0) self.block = batch[left - left % block_length ..][0..block_length].*;
+                            offset += left;
+                            i += left;
                         }
-                        continue :batches;
+                        continue :blocks;
                     }
-                };
+                }
 
-                mem.writeInt(u64, counters[0][0..8], index, .little);
-                self.d_squeeze = self.d.cloneCompact();
-                self.d_squeeze.duplex(&.{}, &counters[0], counter_trailer);
-                const n = @min(block_length, left);
-                self.d_squeeze.xor(out[i..][0..n], in[i..][0..n]);
-                offset += n;
-                i += n;
+                var counter: [block_length]u8 = @splat(0);
+                mem.writeInt(u64, counter[0..8], index, .little);
+                var clone = self.d.cloneCompact();
+                clone.duplex(&self.block, &counter, counter_trailer);
+                const len = @min(block_length, left);
+                xorBytes(out[i..][0..len], if (in) |src| src[i..][0..len] else null, self.block[0..len]);
+                offset += len;
+                i += len;
             }
         }
 
-        /// The block of each clone, at `offset` in its chunk.
-        /// The first `count` chunks are full, and the next one is in for `tail_length` bytes.
-        /// A clone with nothing to do gets the block of the first clone again.
-        inline fn blocksOf(
-            comptime n: comptime_int,
-            comptime len: usize,
-            chunks: []const u8,
-            count: usize,
-            tail_length: usize,
-            offset: usize,
-        ) [n]*const [len]u8 {
-            var blocks: [n]*const [len]u8 = undefined;
-            inline for (&blocks, 0..) |*block, i| {
-                const chunk = if (i < count or (i == count and offset < tail_length)) i else 0;
-                block.* = chunks[chunk * chunk_length + offset ..][0..len];
-            }
-            return blocks;
-        }
-
-        /// Absorb a slice of bytes block by block. The last block gets `last_trailer`.
-        fn absorb(d: *Duplex, in: []const u8, last_trailer: Duplex.Trailer) void {
-            var left = in;
-            while (left.len > block_length) : (left = left[block_length..]) {
-                d.duplex(&.{}, left[0..block_length], empty_trailer);
-            }
-            d.duplex(&.{}, left, last_trailer);
-        }
-
-        /// Like `absorb()`, for an input that comes in pieces.
+        /// What the main duplex absorbs after its first chunk: the chaining values,
+        /// and the end of that chunk if it doesn't end a block.
+        /// They wait here to be absorbed many blocks at a time, which is faster.
         const Root = struct {
             d: *Duplex,
-            buf: [block_length]u8 = undefined,
+            buf: [root_buffer_length]u8 = undefined,
             len: usize = 0,
 
-            fn update(self: *Root, bytes: []const u8) void {
-                var left = bytes;
-                if (left.len == 0) return;
-
-                // Hold on to a block until we know it isn't the last one.
-                if (self.len > 0) {
-                    const n = @min(block_length - self.len, left.len);
-                    @memcpy(self.buf[self.len..][0..n], left[0..n]);
-                    self.len += n;
-                    left = left[n..];
-                    if (left.len == 0) return;
-                    self.d.duplex(&.{}, &self.buf, empty_trailer);
+            fn reserve(self: *Root, len: usize) []u8 {
+                if (self.len + len > self.buf.len) {
+                    // More bytes follow, so none of these blocks is the last one.
+                    const whole = self.len - self.len % block_length;
+                    assert(whole != 0);
+                    self.d.absorb(self.buf[0..whole], empty_trailer);
+                    mem.copyForwards(u8, &self.buf, self.buf[whole..self.len]);
+                    self.len -= whole;
                 }
-                while (left.len > block_length) : (left = left[block_length..]) {
-                    self.d.duplex(&.{}, left[0..block_length], empty_trailer);
-                }
-                @memcpy(self.buf[0..left.len], left);
-                self.len = left.len;
-            }
-
-            fn final(self: *Root, last_trailer: Duplex.Trailer) void {
-                self.d.duplex(&.{}, self.buf[0..self.len], last_trailer);
+                defer self.len += len;
+                return self.buf[self.len..][0..len];
             }
         };
+
+        /// Absorb an input longer than a chunk, except the end that is left in `root`.
+        /// The first chunk goes to the main duplex, the others to clones of it that each give a chaining value.
+        fn absorbChunks(self: *Self, in: []const u8, root: *Root) void {
+            const start = self.d.cloneCompact();
+            var chunks = in;
+            var first = true;
+
+            batches: while (batch_sizes.len != 0) {
+                const full = chunks.len / chunk_length;
+                if (full + @intFromBool(chunks.len % chunk_length != 0) < 2) break;
+
+                // The narrowest batch that holds the full chunks: a wider one costs more.
+                inline for (batch_sizes) |n| {
+                    if (n >= full or n == max_batch_size) {
+                        chunks = self.absorbBatch(n, chunks, &start, first, root);
+                        first = false;
+                        continue :batches;
+                    }
+                }
+            }
+
+            if (first) {
+                const whole = chunk_length - chunk_length % block_length;
+                if (whole != 0) self.d.absorb(chunks[0..whole], empty_trailer);
+                @memcpy(root.reserve(chunk_length - whole), chunks[whole..chunk_length]);
+                chunks = chunks[chunk_length..];
+            }
+            while (chunks.len != 0) {
+                const chunk = chunks[0..@min(chunk_length, chunks.len)];
+                chunks = chunks[chunk.len..];
+                var clone = start;
+                clone.absorb(chunk, chaining_value_trailer);
+                clone.squeeze(root.reserve(chaining_value_length));
+            }
+        }
+
+        /// Absorb up to `n` full chunks, and the shorter last one if a clone is free.
+        /// Returns what's left.
+        fn absorbBatch(
+            self: *Self,
+            comptime n: comptime_int,
+            chunks: []const u8,
+            start: *const Duplex,
+            first: bool,
+            root: *Root,
+        ) []const u8 {
+            const count = @min(chunks.len / chunk_length, n);
+            const tail_length = chunks.len - count * chunk_length;
+            const joins = count < n and tail_length != 0;
+
+            var clones: Duplex.Parallel(n) = .init(start);
+            // Idle clones read the first chunk again, so that every read stays inside the input.
+            var blocks: [n][]const u8 = undefined;
+            for (&blocks, 0..) |*bytes, i| bytes.* = chunks[if (i < count) i * chunk_length else 0..];
+            var before: usize = blocks_per_chunk - 1;
+
+            if (joins) {
+                // The shorter chunk starts late, to end with the others.
+                const tail_blocks = (tail_length - 1) / block_length;
+                const head = before - tail_blocks;
+                if (head != 0) {
+                    if (count == 1) {
+                        // A single chunk is faster outside of a batch.
+                        var one = start.*;
+                        one.absorb(blocks[0][0 .. head * block_length], empty_trailer);
+                        clones.set(0, &one);
+                    } else {
+                        clones.absorb(blocks, head);
+                    }
+                    for (&blocks) |*bytes| bytes.* = bytes.*[head * block_length ..];
+                    clones.set(count, start);
+                }
+                blocks[count] = chunks[count * chunk_length ..];
+                before = tail_blocks;
+            }
+
+            const whole_first_chunk = first and last_block_length == block_length;
+            if (first and !whole_first_chunk) {
+                // The end of the first chunk goes with the chaining values.
+                clones.absorb(blocks, before);
+                for (&blocks) |*bytes| bytes.* = bytes.*[before * block_length ..];
+                before = 0;
+                self.d = clones.get(0);
+                @memcpy(root.reserve(last_block_length), blocks[0][0..last_block_length]);
+            }
+
+            var last: [n][]const u8 = undefined;
+            for (&last, blocks, 0..) |*bytes, chunk, i| {
+                const end = chunk[before * block_length ..];
+                bytes.* = if (joins and i == count) end else end[0..last_block_length];
+            }
+            var trailers: [n]Duplex.Trailer = @splat(chaining_value_trailer);
+            // More input follows the first chunk, so its last block isn't the last one of the main duplex.
+            if (whole_first_chunk) trailers[0] = empty_trailer;
+
+            var cvs: [n][chaining_value_length]u8 = undefined;
+            clones.duplex(blocks, before, last, trailers, chaining_value_length, &cvs);
+            if (whole_first_chunk) self.d = clones.get(0);
+
+            const from = @intFromBool(first);
+            const to = count + @intFromBool(joins);
+            @memcpy(root.reserve((to - from) * chaining_value_length), mem.sliceAsBytes(cvs[from..to]));
+            return if (joins) chunks[chunks.len..] else chunks[count * chunk_length ..];
+        }
     };
 }
 
@@ -693,101 +725,342 @@ fn appendBit(trailer: anytype, bit: u1) @Int(.unsigned, @bitSizeOf(@TypeOf(trail
     return trailer + (end << bit);
 }
 
+/// The lane after a block: the trailer, a bit that says if the block was full, and the padding byte.
+fn trailerLane(padding: u8, trailer: u6, full: bool) u64 {
+    return appendBit(trailer, @intFromBool(full)) | (@as(u64, padding) << 56);
+}
+
+/// `bytes`, followed by a 1 bit and zeros up to a whole block, in `buf`.
+fn padBlock(buf: anytype, bytes: []const u8) []const u8 {
+    const lanes = buf.len / 8;
+    buf.* = @splat(0);
+    // Copies of a known length don't call memcpy.
+    // The last lane is written in one go: bytes written one by one are slow to read back.
+    switch (bytes.len / 8) {
+        inline 0...lanes - 1 => |whole| buf[0 .. 8 * whole].* = bytes[0 .. 8 * whole].*,
+        else => unreachable,
+    }
+    mem.writeInt(u64, buf[bytes.len - bytes.len % 8 ..][0..8], lastLane(bytes), .little);
+    return buf;
+}
+
+/// What's left of `bytes` after its last whole lane, followed by a 1 bit.
+fn lastLane(bytes: []const u8) u64 {
+    const rest = bytes.len % 8;
+    const end = @as(u64, 1) << @intCast(8 * rest);
+    if (rest == 0) return end;
+    if (bytes.len >= 8) return (mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little) >> @intCast(64 - 8 * rest)) | end;
+    var lane = end;
+    for (bytes, 0..) |byte, i| lane |= @as(u64, byte) << @intCast(8 * i);
+    return lane;
+}
+
+/// `out = in ^ stream`, or `out = stream` without `in`. `out` and `in` can be the same buffer.
+fn xorBytes(out: []u8, in: ?[]const u8, stream: []const u8) void {
+    const src = in orelse return @memcpy(out, stream);
+    // 64-bit words, because vectors of bytes are slow on targets without SIMD.
+    const Words = @Vector(4, u64);
+    var i: usize = 0;
+    while (i + @sizeOf(Words) <= out.len) : (i += @sizeOf(Words)) {
+        const x: Words = mem.bytesToValue([4]u64, src[i..][0..@sizeOf(Words)]);
+        const k: Words = mem.bytesToValue([4]u64, stream[i..][0..@sizeOf(Words)]);
+        out[i..][0..@sizeOf(Words)].* = mem.toBytes(@as([4]u64, x ^ k));
+    }
+    for (out[i..], src[i..], stream[i..]) |*o, x, k| o.* = x ^ k;
+}
+
+/// Store the first `size` bytes of `lanes`, XORed with `in` if there is one.
+inline fn storeLanes(comptime n: comptime_int, comptime size: comptime_int, lanes: [n]u64, out: *[size]u8, in: ?*const [size]u8) void {
+    const whole = size / 8;
+    const rest = size % 8;
+    if (whole > 0) {
+        const Whole = @Vector(whole, u64);
+        var part: Whole = lanes[0..whole].*;
+        if (in) |src| part ^= mem.littleToNative(Whole, mem.bytesToValue([whole]u64, src[0 .. 8 * whole]));
+        mem.bytesAsValue([whole]u64, out[0 .. 8 * whole]).* = mem.nativeToLittle(Whole, part);
+    }
+    if (rest != 0) {
+        var last: [8]u8 = undefined;
+        mem.writeInt(u64, &last, lanes[whole], .little);
+        if (in) |src| for (last[0..rest], src[8 * whole ..]) |*b, x| {
+            b.* ^= x;
+        };
+        out[8 * whole ..].* = last[0..rest].*;
+    }
+}
+
 /// Transpose a square matrix, given as rows.
+/// Each shuffle is a single x86 instruction.
+/// With `std.simd.interlace()`, the compiler emitted twice as many.
 fn transpose(comptime n: comptime_int, rows: *[n]@Vector(n, u64)) void {
     comptime assert(n >= 2 and math.isPowerOfTwo(n));
-    const half = n / 2;
-    const quarter = n / 4;
+    const V = @Vector(n, u64);
 
-    // Transpose every 2x2 block first.
-    // After that, elements only move in pairs, which is cheap with 128-bit registers.
-    var pairs: [2][half]@Vector(n, u64) = undefined;
-    inline for (0..half) |i| {
-        const a = simd.deinterlace(2, rows[2 * i]);
-        const b = simd.deinterlace(2, rows[2 * i + 1]);
-        pairs[0][i] = simd.interlace(.{ a[0], b[0] });
-        pairs[1][i] = simd.interlace(.{ a[1], b[1] });
-    }
-    // Then split the pairs at even and at odd positions until they're all in place.
-    inline for (&pairs) |*matrix| {
-        inline for (0..math.log2(half)) |_| {
-            const previous = matrix.*;
-            inline for (0..quarter) |i| {
-                const a = simd.deinterlace(4, previous[2 * i]);
-                const b = simd.deinterlace(4, previous[2 * i + 1]);
-                matrix[i] = simd.join(simd.interlace(.{ a[0], a[1] }), simd.interlace(.{ b[0], b[1] }));
-                matrix[i + quarter] = simd.join(simd.interlace(.{ a[2], a[3] }), simd.interlace(.{ b[2], b[3] }));
-            }
+    if (n > 8) {
+        const lanes: [n][n]u64 = rows.*;
+        inline for (rows, 0..) |*row, i| {
+            var column: [n]u64 = undefined;
+            inline for (&column, lanes) |*lane, other| lane.* = other[i];
+            row.* = column;
         }
+        return;
     }
-    inline for (0..half) |i| {
-        rows[2 * i] = pairs[0][i];
-        rows[2 * i + 1] = pairs[1][i];
+
+    // Interleave pairs of rows, even lanes and odd lanes.
+    var even: [n / 2]V = undefined;
+    var odd: [n / 2]V = undefined;
+    inline for (&even, &odd, 0..) |*e, *o, i| {
+        e.* = @shuffle(u64, rows[2 * i], rows[2 * i + 1], unpack(n, 0));
+        o.* = @shuffle(u64, rows[2 * i], rows[2 * i + 1], unpack(n, 1));
+    }
+    switch (n) {
+        2 => rows.* = .{ even[0], odd[0] },
+        4 => rows.* = .{
+            @shuffle(u64, even[0], even[1], [4]i32{ 0, 1, ~@as(i32, 0), ~@as(i32, 1) }),
+            @shuffle(u64, odd[0], odd[1], [4]i32{ 0, 1, ~@as(i32, 0), ~@as(i32, 1) }),
+            @shuffle(u64, even[0], even[1], [4]i32{ 2, 3, ~@as(i32, 2), ~@as(i32, 3) }),
+            @shuffle(u64, odd[0], odd[1], [4]i32{ 2, 3, ~@as(i32, 2), ~@as(i32, 3) }),
+        },
+        8 => {
+            // Then move 128-bit pieces into place.
+            const low = [8]i32{ 0, 1, 2, 3, ~@as(i32, 0), ~@as(i32, 1), ~@as(i32, 2), ~@as(i32, 3) };
+            const high = [8]i32{ 4, 5, 6, 7, ~@as(i32, 4), ~@as(i32, 5), ~@as(i32, 6), ~@as(i32, 7) };
+            const evens = [8]i32{ 0, 1, 4, 5, ~@as(i32, 0), ~@as(i32, 1), ~@as(i32, 4), ~@as(i32, 5) };
+            const odds = [8]i32{ 2, 3, 6, 7, ~@as(i32, 2), ~@as(i32, 3), ~@as(i32, 6), ~@as(i32, 7) };
+            const lanes_02 = .{ @shuffle(u64, even[0], even[1], low), @shuffle(u64, even[2], even[3], low) };
+            const lanes_13 = .{ @shuffle(u64, odd[0], odd[1], low), @shuffle(u64, odd[2], odd[3], low) };
+            const lanes_46 = .{ @shuffle(u64, even[0], even[1], high), @shuffle(u64, even[2], even[3], high) };
+            const lanes_57 = .{ @shuffle(u64, odd[0], odd[1], high), @shuffle(u64, odd[2], odd[3], high) };
+            rows.* = .{
+                @shuffle(u64, lanes_02[0], lanes_02[1], evens),
+                @shuffle(u64, lanes_13[0], lanes_13[1], evens),
+                @shuffle(u64, lanes_02[0], lanes_02[1], odds),
+                @shuffle(u64, lanes_13[0], lanes_13[1], odds),
+                @shuffle(u64, lanes_46[0], lanes_46[1], evens),
+                @shuffle(u64, lanes_57[0], lanes_57[1], evens),
+                @shuffle(u64, lanes_46[0], lanes_46[1], odds),
+                @shuffle(u64, lanes_57[0], lanes_57[1], odds),
+            };
+        },
+        else => unreachable,
     }
 }
 
-/// Keccak-p[1600] on `n` states at once. `st[i]` is the lane `i` of every state.
-inline fn permute(comptime n: comptime_int, comptime rounds: u5, st: *[25]@Vector(n, u64)) void {
+/// The mask that interleaves the lanes `2k + odd` of two vectors.
+fn unpack(comptime n: comptime_int, comptime odd: comptime_int) [n]i32 {
+    var mask: [n]i32 = undefined;
+    for (0..n / 2) |k| {
+        mask[2 * k] = 2 * k + odd;
+        mask[2 * k + 1] = ~@as(i32, 2 * k + odd);
+    }
+    return mask;
+}
+
+// With AVX-512, a single state is faster in vector registers, one lane per register.
+const one_state_in_vectors = builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .avx512vl);
+
+/// The same lane of `n` states.
+/// One state gets the low half of a vector register, or a general register.
+fn Lanes(comptime n: comptime_int) type {
+    if (n > 1) return @Vector(n, u64);
+    return if (one_state_in_vectors) @Vector(2, u64) else u64;
+}
+
+inline fn splat(comptime V: type, lane: u64) V {
+    return if (V == u64) lane else @splat(lane);
+}
+
+inline fn fromArray(comptime n: comptime_int, lanes: [n]u64) Lanes(n) {
+    return if (n > 1) lanes else splat(Lanes(1), lanes[0]);
+}
+
+inline fn toArray(comptime n: comptime_int, lanes: Lanes(n)) [n]u64 {
+    if (n > 1) return lanes;
+    return .{if (Lanes(1) == u64) lanes else lanes[0]};
+}
+
+/// The last block of each state, and the lane that follows it.
+/// With several states, the caller pads the blocks.
+fn LastBlocks(comptime n: comptime_int) type {
+    return struct { blocks: [n][]const u8, trailers: [n]u64 };
+}
+
+/// Make state `i` absorb `count` full blocks from `blocks[i]`, then its block in `last`, if there is one.
+/// `st[i]` is lane `i` of every state.
+/// Only the lanes after the block are read.
+/// After a last block, the first `out_lanes` lanes are written too.
+inline fn absorbBlocks(
+    comptime Duplex: type,
+    comptime n: comptime_int,
+    comptime out_lanes: comptime_int,
+    st: *[25][n]u64,
+    blocks: [n][*]const u8,
+    count: usize,
+    last: ?*const LastBlocks(n),
+) void {
     @setEvalBranchQuota(100_000);
-    const Lanes = @Vector(n, u64);
-    const round_constants = [24]u64{
-        0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
-        0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-        0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
-        0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
-        0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
-        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
-    };
-    const pi = [24]u5{
-        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-    };
+    const block_lanes = Duplex.block_lanes;
+    const rounds = Duplex.permutation_rounds;
+    const padding = Duplex.sponge_padding;
+    const V = Lanes(n);
+    const capacity = comptime laneRange(block_lanes, 25);
 
-    // With 8 states, there are enough registers to write the rounds out, and that's faster.
-    const unrolled = if (n == 8) rounds else 1;
-
-    // Computing the parity of the columns at the end of a round, for the next one, gives faster code than at the start.
-    var parity = columnParity(n, st);
-    var first: usize = round_constants.len - rounds;
-    while (first < round_constants.len) : (first += unrolled) {
-        inline for (0..unrolled) |round| {
-            // Read up front: reading it where it's used makes WebAssembly slower.
-            const round_constant = round_constants[first + round];
-
-            // Each step writes to a new array, which is also faster than updating the state in place.
-            var a = st.*;
-            inline for (0..5) |x| {
-                const d = parity[(x + 4) % 5] ^ math.rotl(Lanes, parity[(x + 1) % 5], 1);
-                inline for (0..5) |y| a[5 * y + x] ^= d;
-            }
-
-            var b: [25]Lanes = undefined;
-            b[0] = a[0];
-            comptime var from = 1;
-            comptime var rotation = 0;
-            inline for (pi, 1..) |to, i| {
-                rotation = (rotation + i) % 64;
-                b[to] = math.rotl(Lanes, a[from], rotation);
-                from = to;
-            }
-
-            inline for (0..5) |y| {
-                inline for (0..5) |x| {
-                    st[5 * y + x] = b[5 * y + x] ^ (~b[5 * y + (x + 1) % 5] & b[5 * y + (x + 2) % 5]);
+    var a: [25]V = undefined;
+    inline for (a[block_lanes..], st[block_lanes..]) |*lanes, lane| lanes.* = fromArray(n, lane);
+    var next = blocks;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const is_last = i == count;
+        var trailer = splat(V, trailerLane(padding, 0b1, true));
+        if (is_last) {
+            if (last) |end| {
+                trailer = fromArray(n, end.trailers);
+                if (n == 1) {
+                    loadLastBlock(block_lanes, &a, end.blocks[0]);
+                } else {
+                    for (&next, end.blocks) |*ptr, bytes| ptr.* = bytes.ptr;
+                    loadBlocks(n, block_lanes, &a, next);
                 }
-            }
-
-            st[0] ^= @splat(round_constant);
-            parity = columnParity(n, st);
+            } else break;
+        } else {
+            loadBlocks(n, block_lanes, &a, next);
         }
+        a[block_lanes] ^= trailer;
+        var c = permuteAllButLast(V, rounds, &a);
+        // Before another block, only the lanes it doesn't overwrite are needed.
+        if (is_last) {
+            round(V, &a, &c, round_constants[23], capacity | laneRange(0, out_lanes), true);
+            inline for (st[0..out_lanes], a[0..out_lanes]) |*lane, lanes| lane.* = toArray(n, lanes);
+            break;
+        }
+        round(V, &a, &c, round_constants[23], capacity, true);
+        inline for (&next) |*ptr| ptr.* += 8 * block_lanes;
+    }
+    inline for (st[block_lanes..], a[block_lanes..]) |*lane, lanes| lane.* = toArray(n, lanes);
+}
+
+/// Load the last block of a single state, padded if it's short.
+/// It's read in place: a padded copy costs more on WebAssembly.
+inline fn loadLastBlock(comptime count: comptime_int, a: *[25]Lanes(1), bytes: []const u8) void {
+    const whole = bytes.len / 8;
+    const end = lastLane(bytes);
+    inline for (a[0..count], 0..) |*lanes, i| {
+        const lane = if (i < whole) mem.readInt(u64, bytes[8 * i ..][0..8], .little) else if (i == whole) end else 0;
+        lanes.* = splat(Lanes(1), lane);
     }
 }
 
-inline fn columnParity(comptime n: comptime_int, st: *const [25]@Vector(n, u64)) [5]@Vector(n, u64) {
-    var parity: [5]@Vector(n, u64) = undefined;
-    inline for (&parity, 0..) |*lanes, x| {
-        lanes.* = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
+/// Load the first `count` lanes of the block of each state.
+inline fn loadBlocks(comptime n: comptime_int, comptime count: comptime_int, a: *[25]Lanes(n), blocks: [n][*]const u8) void {
+    @setEvalBranchQuota(100_000);
+    if (n == 1) {
+        inline for (a[0..count], 0..) |*lanes, i| lanes.* = splat(Lanes(1), mem.readInt(u64, blocks[0][8 * i ..][0..8], .little));
+        return;
     }
-    return parity;
+    // A vector holds the same lane of every state, but a block holds consecutive lanes of one state.
+    // So load the blocks as rows, and transpose them.
+    comptime var from = 0;
+    inline while (from < count) : (from += n) {
+        const size: comptime_int = @min(n, count - from);
+        var rows: [n]@Vector(n, u64) = undefined;
+        inline for (&rows, blocks) |*row, block| {
+            var lanes: [n]u64 = @splat(0);
+            lanes[0..size].* = mem.littleToNative(@Vector(size, u64), mem.bytesToValue([size]u64, block[8 * from ..][0 .. 8 * size]));
+            row.* = lanes;
+        }
+        transpose(n, &rows);
+        a[from..][0..size].* = rows[0..size].*;
+    }
+}
+
+/// Keccak-p[1600] on a single state.
+/// Not inlined, so that every caller shares it.
+noinline fn permuteState(comptime rounds: u5, st: *[25]u64) void {
+    const V = Lanes(1);
+    var a: [25]V = undefined;
+    inline for (&a, st) |*lanes, lane| lanes.* = splat(V, lane);
+    var c = permuteAllButLast(V, rounds, &a);
+    round(V, &a, &c, round_constants[23], laneRange(0, 25), true);
+    inline for (st, a) |*lane, lanes| lane.* = toArray(1, lanes)[0];
+}
+
+const round_constants = [24]u64{
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
+    0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
+    0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+};
+
+/// For each lane of each row after rho and pi: the lane it comes from, and how far that one is rotated.
+const rho_pi = [5][5]struct { u5, u6 }{
+    .{ .{ 0, 0 }, .{ 6, 44 }, .{ 12, 43 }, .{ 18, 21 }, .{ 24, 14 } },
+    .{ .{ 3, 28 }, .{ 9, 20 }, .{ 10, 3 }, .{ 16, 45 }, .{ 22, 61 } },
+    .{ .{ 1, 1 }, .{ 7, 6 }, .{ 13, 25 }, .{ 19, 8 }, .{ 20, 18 } },
+    .{ .{ 4, 27 }, .{ 5, 36 }, .{ 11, 10 }, .{ 17, 15 }, .{ 23, 56 } },
+    .{ .{ 2, 62 }, .{ 8, 55 }, .{ 14, 39 }, .{ 15, 41 }, .{ 21, 2 } },
+};
+
+/// The set of lanes from `from` to `to`, `to` excluded.
+fn laneRange(comptime from: comptime_int, comptime to: comptime_int) u25 {
+    return @truncate((@as(u26, 1) << to) - (@as(u26, 1) << from));
+}
+
+/// All the rounds of Keccak-p[1600] but the last one.
+/// Returns the parity of the columns for that one.
+inline fn permuteAllButLast(comptime V: type, comptime rounds: u5, a: *[25]V) [5]V {
+    var c = columnParity(V, a);
+    roundsBetween(V, 24 - @as(usize, rounds), a, &c);
+    return c;
+}
+
+/// Rounds `first` to 22 on the states in `a`.
+/// `c` is the parity of their columns, and is kept up to date.
+inline fn roundsBetween(comptime V: type, comptime first: usize, a: *[25]V, c: *[5]V) void {
+    // The fastest number of rounds per iteration on each target.
+    // WebAssembly runtimes slow down a lot with bigger loops of vectors.
+    const per_pass = if (builtin.cpu.arch.isWasm()) (if (V == u64) 3 else 1) else 2;
+    const looped = (23 - first) / per_pass * per_pass;
+
+    var r: usize = first;
+    while (r < first + looped) : (r += per_pass) {
+        inline for (0..per_pass) |k| round(V, a, c, round_constants[r + k], laneRange(0, 25), false);
+    }
+    inline for (first + looped..23) |k| round(V, a, c, round_constants[k], laneRange(0, 25), false);
+}
+
+/// One round on the states in `a`, given the parity `c` of their columns.
+/// Only the lanes in `keep` are computed, and `c` is updated unless it's the last round.
+/// Going row by row was the fastest order, and needs fewer registers.
+inline fn round(comptime V: type, a: *[25]V, c: *[5]V, round_constant: u64, comptime keep: u25, comptime last: bool) void {
+    @setEvalBranchQuota(100_000);
+    var d: [5]V = undefined;
+    inline for (.{ 0, 2, 4, 1, 3 }) |x| d[x] = c[(x + 4) % 5] ^ math.rotl(V, c[(x + 1) % 5], 1);
+    inline for (0..5) |y| a[5 * y] ^= d[0];
+
+    var e: [25]V = undefined;
+    inline for (rho_pi, 0..) |row, y| {
+        var b: [5]V = undefined;
+        inline for (&b, row) |*lane, source| {
+            const from, const rotation = source;
+            const t = if (from % 5 == 0) a[from] else a[from] ^ d[from % 5];
+            lane.* = math.rotl(V, t, rotation);
+        }
+        inline for (0..5) |x| e[5 * y + x] = b[x] ^ (~b[(x + 1) % 5] & b[(x + 2) % 5]);
+    }
+    e[0] ^= splat(V, round_constant);
+
+    inline for (a, e, 0..) |*lane, new, i| {
+        if ((keep >> i) & 1 != 0) lane.* = new;
+    }
+    if (!last) c.* = columnParity(V, a);
+}
+
+inline fn columnParity(comptime V: type, a: *const [25]V) [5]V {
+    var c: [5]V = undefined;
+    inline for (&c, 0..) |*lanes, x| lanes.* = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+    return c;
 }
 
 test {

@@ -37,54 +37,59 @@ test "OverwriteDuplex against SHAKE and TurboSHAKE" {
     }) |instance| {
         const Duplex, const Xof, const turbo = instance;
         const rho = Duplex.block_length;
-        // The first call is the one that absorbs the key.
-        const calls = [_]Call{
-            .{ .len = 5, .trailer = 1, .sponge_trailer = 0b10 },
-            .{ .len = 0, .trailer = 1, .sponge_trailer = 0b10 },
-            .{ .len = rho, .trailer = 0b111111, .sponge_trailer = 0b1111111 },
-            .{ .len = 1, .trailer = 0b10, .sponge_trailer = 0b100 },
-            .{ .len = rho - 1, .trailer = 0b11111, .sponge_trailer = 0b101111 },
-            .{ .len = rho, .trailer = 1, .sponge_trailer = 0b11 },
-        };
+        // The empty key has a shortcut.
+        for ([_]usize{ 5, 0 }) |key_len| {
+            // The first call is the one that absorbs the key.
+            const calls = [_]Call{
+                .{ .len = key_len, .trailer = 1, .sponge_trailer = 0b10 },
+                .{ .len = 0, .trailer = 1, .sponge_trailer = 0b10 },
+                .{ .len = rho, .trailer = 0b111111, .sponge_trailer = 0b1111111 },
+                .{ .len = 1, .trailer = 0b10, .sponge_trailer = 0b100 },
+                .{ .len = rho - 1, .trailer = 0b11111, .sponge_trailer = 0b101111 },
+                .{ .len = rho, .trailer = 1, .sponge_trailer = 0b11 },
+            };
 
-        // What the sponge function has to absorb to return the same thing as the duplex.
-        var message: [calls.len * (rho + 8)]u8 = undefined;
-        var message_len: usize = 0;
-        var expected: [rho]u8 = @splat(0);
-        var d: Duplex = undefined;
+            // What the sponge function has to absorb to return the same thing as the duplex.
+            var message: [calls.len * (rho + 8)]u8 = undefined;
+            var message_len: usize = 0;
+            var expected: [rho]u8 = @splat(0);
+            var d: Duplex = undefined;
 
-        for (calls, 0..) |call, i| {
-            var block: [rho]u8 = @splat(0);
-            fillPattern(block[0..call.len], 3, i);
-            const in = block[0..call.len];
-            if (call.len < rho) block[call.len] = 0x01;
+            for (calls, 0..) |call, i| {
+                var block: [rho]u8 = @splat(0);
+                fillPattern(block[0..call.len], 3, i);
+                const in = block[0..call.len];
+                if (call.len < rho) block[call.len] = 0x01;
 
-            // Overwriting the state with a block is like XORing in the block and the previous output.
-            for (message[message_len..][0..rho], block, expected) |*m, b, z| m.* = b ^ z;
-            message_len += rho;
-            var xof: Xof = .init(if (turbo) .{ .delim = call.sponge_trailer } else .{});
-            xof.update(message[0..message_len]);
-            if (!turbo) xof.update(&.{ call.sponge_trailer, 0, 0, 0, 0, 0, 0 });
-            xof.squeeze(&expected);
-            message[message_len..][0..8].* = .{ call.sponge_trailer, 0, 0, 0, 0, 0, 0, if (turbo) 0x80 else 0x9f };
-            message_len += 8;
+                // Overwriting the state with a block is like XORing in the block and the previous output.
+                for (message[message_len..][0..rho], block, expected) |*m, b, z| m.* = b ^ z;
+                message_len += rho;
+                var xof: Xof = .init(if (turbo) .{ .delim = call.sponge_trailer } else .{});
+                xof.update(message[0..message_len]);
+                if (!turbo) xof.update(&.{ call.sponge_trailer, 0, 0, 0, 0, 0, 0 });
+                xof.squeeze(&expected);
+                message[message_len..][0..8].* = .{ call.sponge_trailer, 0, 0, 0, 0, 0, 0, if (turbo) 0x80 else 0x9f };
+                message_len += 8;
 
-            if (i == 0) {
-                d = .init(in);
-                continue;
+                if (i == 0) {
+                    d = .init(in);
+                    // Nothing to squeeze yet.
+                    try testing.expectEqual(rho, d.offset);
+                    continue;
+                }
+                var out: [rho]u8 = undefined;
+                var clone = d.cloneCompact();
+                try testing.expectEqual(rho, clone.offset);
+                clone.duplex(&out, in, call.trailer);
+                try testing.expectEqualSlices(u8, &expected, &out);
+
+                // The same output in three pieces, leaving a byte that the next clone must not get.
+                const zeros: [rho]u8 = @splat(0);
+                d.duplex(out[0..10], in, call.trailer);
+                d.squeeze(out[10..50]);
+                d.xor(out[50 .. rho - 1], zeros[50 .. rho - 1]);
+                try testing.expectEqualSlices(u8, expected[0 .. rho - 1], out[0 .. rho - 1]);
             }
-            var out: [rho]u8 = undefined;
-            var clone = d.cloneCompact();
-            try testing.expectEqual(rho, clone.offset);
-            clone.duplex(&out, in, call.trailer);
-            try testing.expectEqualSlices(u8, &expected, &out);
-
-            // The same output in three pieces, leaving a byte that the next clone must not get.
-            const zeros: [rho]u8 = @splat(0);
-            d.duplex(out[0..10], in, call.trailer);
-            d.squeeze(out[10..50]);
-            d.xor(out[50 .. rho - 1], zeros[50 .. rho - 1]);
-            try testing.expectEqualSlices(u8, expected[0 .. rho - 1], out[0 .. rho - 1]);
         }
     }
 }
@@ -182,6 +187,10 @@ fn WithParallelism(comptime Duplex: type, comptime parallel_blocks: comptime_int
             self.d.xor(out, in);
         }
 
+        pub fn absorb(self: *Self, in: []const u8, trailer: Trailer) void {
+            self.d.absorb(in, trailer);
+        }
+
         pub fn Parallel(comptime n: comptime_int) type {
             return struct {
                 const Clones = @This();
@@ -192,20 +201,38 @@ fn WithParallelism(comptime Duplex: type, comptime parallel_blocks: comptime_int
                     return .{ .clones = .init(&d.d) };
                 }
 
+                pub fn set(self: *Clones, i: usize, d: *const Self) void {
+                    self.clones.set(i, &d.d);
+                }
+
                 pub fn get(self: *const Clones, i: usize) Self {
                     return .{ .d = self.clones.get(i) };
                 }
 
-                pub inline fn duplex(self: *Clones, comptime len: usize, blocks: [n]*const [len]u8, trailer: Trailer) void {
-                    self.clones.duplex(len, blocks, trailer);
+                pub fn absorb(self: *Clones, blocks: [n][]const u8, count: usize) void {
+                    self.clones.absorb(blocks, count);
                 }
 
-                pub fn squeeze(self: *const Clones, comptime len: usize, out: *[n * len]u8) void {
-                    self.clones.squeeze(len, out);
+                pub fn duplex(
+                    self: *Clones,
+                    blocks: [n][]const u8,
+                    count: usize,
+                    last: [n][]const u8,
+                    trailers: [n]Trailer,
+                    comptime len: usize,
+                    out: *[n][len]u8,
+                ) void {
+                    self.clones.duplex(blocks, count, last, trailers, len, out);
                 }
 
-                pub fn xor(self: *const Clones, comptime len: usize, out: *[n * len]u8, in: *const [n * len]u8) void {
-                    self.clones.xor(len, out, in);
+                pub fn xorCounters(
+                    d: *const Self,
+                    first: u64,
+                    trailer: Trailer,
+                    out: *[n * block_length]u8,
+                    in: ?*const [n * block_length]u8,
+                ) void {
+                    Duplex.Parallel(n).xorCounters(&d.d, first, trailer, out, in);
                 }
             };
         }
@@ -243,6 +270,10 @@ fn WithoutParallel(comptime Duplex: type) type {
 
         pub fn xor(self: *Self, out: []u8, in: []const u8) void {
             self.d.xor(out, in);
+        }
+
+        pub fn absorb(self: *Self, in: []const u8, trailer: Trailer) void {
+            self.d.absorb(in, trailer);
         }
     };
 }
@@ -308,13 +339,13 @@ test "FlightDeck against the reference algorithm" {
     const allocator = testing.allocator;
 
     inline for (.{
-        .{ TurboShake128Duplex, 5120, 32 },
+        .{ TurboShake128Duplex, 5120, 32, 37 },
         // Chunks that don't end on a block boundary, chaining values that don't end on a lane boundary.
-        .{ TurboShake128Duplex, 327, 13 },
-        // One block per chunk, chaining values as long as a block.
-        .{ TurboShake256Duplex, 128, 128 },
+        .{ TurboShake128Duplex, 327, 13, 37 },
+        // Chaining values as long as a block, and enough chunks for them to fill the buffer where they wait.
+        .{ TurboShake256Duplex, 200, 128, 72 },
     }) |parameters| {
-        const Duplex, const alpha, const c = parameters;
+        const Duplex, const alpha, const c, const half_chunks_max = parameters;
         const rho = Duplex.block_length;
 
         var reference: ReferenceFlightDeck(Duplex, alpha, c) = .{ .d = .init("key") };
@@ -327,17 +358,18 @@ test "FlightDeck against the reference algorithm" {
             FlightDeck(WithParallelism(Duplex, 8), alpha, c),
         } = .{ .init("key"), .init("key"), .init("key"), .init("key"), .init("key") };
 
-        const in = try allocator.alloc(u8, 18 * alpha + rho + 1);
-        defer allocator.free(in);
-        for (in, 0..) |*b, i| b.* = @truncate(5 * i + 1);
         var expected: [20 * rho]u8 = undefined;
         var out: [expected.len]u8 = undefined;
+        // Also used to XOR the output.
+        const in = try allocator.alloc(u8, @max((half_chunks_max - 1) * alpha / 2 + rho + 1, out.len));
+        defer allocator.free(in);
+        for (in, 0..) |*b, i| b.* = @truncate(5 * i + 1);
 
         var prng: std.Random.DefaultPrng = .init(testing.random_seed);
         const random = prng.random();
 
         // Lengths around every multiple of half a chunk, where the way chunks are batched changes.
-        for (0..37) |half_chunks| {
+        for (0..half_chunks_max) |half_chunks| {
             for ([_]usize{ 0, 1, 2, rho + 1, rho + 2 }) |extra| {
                 const x = in[0..half_chunks * alpha / 2 + extra -| 1];
                 const trailer = random.intRangeAtMost(u5, 1, 31);
@@ -346,11 +378,12 @@ test "FlightDeck against the reference algorithm" {
                 const first = random.uintAtMost(usize, second);
 
                 try reference.duplexing(allocator, expected[0..z.len], x, trailer);
-                // The same output, in three pieces.
+                // The same output, in three pieces, the last one XORed with the input.
+                for (expected[second..z.len], in[second..z.len]) |*e, m| e.* ^= m;
                 inline for (&decks) |*deck| {
                     deck.duplex(z[0..first], x, trailer);
                     deck.squeeze(z[first..second]);
-                    deck.squeeze(z[second..]);
+                    deck.xor(z[second..], in[second..z.len]);
                     try testing.expectEqualSlices(u8, expected[0..z.len], z);
                 }
             }
