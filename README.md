@@ -3,6 +3,9 @@
 A Zig implementation of FlightDeck and Deck-BO for encrypting and authenticating data.
 Written entirely in Zig, with no dependencies beyond the standard library.
 
+This is the original implementation.
+It was ported to [Rust](https://github.com/jedisct1/rust-flightdeck) and [C](https://github.com/jedisct1/c-flightdeck), and all three give the same results, byte for byte.
+
 ## What's in there
 
 - Duplex cipher: `Shake128Duplex`, `Shake256Duplex`, `TurboShake128Duplex`, `TurboShake256Duplex`.
